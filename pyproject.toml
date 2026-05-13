@@ -29,7 +29,12 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
 ]
 
-dependencies = []
+dependencies = [
+    "ccflow>=0.6.10",
+    "ccflow-etl",
+    "httpx",
+    "jinja2",
+]
 
 [project.optional-dependencies]
 develop = [
@@ -110,6 +115,11 @@ addopts = [
     "--junitxml=junit.xml",
 ]
 testpaths = "ccflow_http/tests"
+markers = [
+    "integration: cross-package tests using only local synthetic fixtures",
+    "e2e: complete local workflow tests using only synthetic fixtures and local storage",
+    "live: tests requiring live provider credentials or external infrastructure",
+]
 
 [tool.ruff]
 line-length = 150
