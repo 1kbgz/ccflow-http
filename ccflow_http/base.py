@@ -2,11 +2,14 @@ from base64 import b64encode
 from csv import DictReader
 from gzip import decompress
 from io import StringIO
+from time import monotonic, sleep
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 import httpx
-from ccflow import BaseModel, CallableModel, ContextBase, Flow, GenericResult
-from ccflow_etl import RetryPolicy
+from ccflow import BaseModel, CallableModel, ContextBase, Flow, GenericResult, PyObjectPath
+from ccflow.utils.retry import RetryPolicy
+from ccflow_etl import ExecutionPolicy
 from jinja2 import Environment
 from pydantic import Field
 
@@ -16,15 +19,19 @@ __all__ = (
     "HTTPContext",
     "HTTPRequestContext",
     "HTTPRequest",
+    "HTTPRetryPolicy",
     "HTTPResponseResult",
     "HTTPResult",
     "HTTPModel",
+    "redact_mapping",
+    "safe_request_dump",
 )
 
 ResponseFormat = Literal["json", "text", "bytes", "csv", "gzip"]
 HTTPMethod = Literal["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]
 HTTPAuthStrategy = Literal["none", "bearer", "api_key_header", "api_key_query", "basic"]
 HTTPPaginationMode = Literal["next_url", "cursor", "page", "offset"]
+HTTPRetryOutcome = Literal["retry", "failed"]
 
 
 class HTTPConfig(BaseModel):
@@ -66,6 +73,79 @@ class HTTPRequest(BaseModel):
     content: Optional[Union[bytes, str]] = None
 
 
+def redact_mapping(values: Dict[str, Any]) -> Dict[str, Any]:
+    redacted = {}
+    for key, value in values.items():
+        normalized_key = key.lower().replace("_", "").replace("-", "")
+        if normalized_key in {"apikey", "authorization", "password"} or "token" in normalized_key or "secret" in normalized_key:
+            redacted[key] = "***"
+        else:
+            redacted[key] = value
+    return redacted
+
+
+def safe_request_dump(request: HTTPRequest) -> Dict[str, Any]:
+    request_data = request.model_dump(exclude={"type_"})
+    request_data["params"] = redact_mapping(request_data.get("params", {}))
+    request_data["headers"] = redact_mapping(request_data.get("headers", {}))
+    return request_data
+
+
+class HTTPRetryEvent(BaseModel):
+    attempt: int
+    outcome: HTTPRetryOutcome
+    delay_seconds: float = 0.0
+    status_code: Optional[int] = None
+    exception_type: Optional[str] = None
+    category: Optional[str] = None
+    message: Optional[str] = None
+
+
+class HTTPRetryPolicy(RetryPolicy):
+    retry_status_codes: List[int] = Field(default_factory=lambda: [429, 500, 502, 503, 504])
+    retry_exceptions: List[PyObjectPath] = Field(
+        default_factory=lambda: [PyObjectPath.validate(httpx.TimeoutException), PyObjectPath.validate(httpx.ConnectError)]
+    )
+    timeout_exception_types: List[str] = Field(
+        default_factory=lambda: ["TimeoutError", "TimeoutException", "ConnectTimeout", "ReadTimeout", "WriteTimeout", "PoolTimeout"]
+    )
+
+    def should_retry_status(self, status_code: Optional[int], attempt: int) -> bool:
+        return status_code in self.retry_status_codes and attempt < self.max_attempts
+
+    def should_retry_exception(self, exception: BaseException, attempt: int) -> bool:
+        return self._should_retry(exception) and attempt < self.max_attempts
+
+    def delay_seconds(self, attempt: int, jitter_value: Optional[float] = None) -> float:
+        if attempt < 1:
+            raise ValueError("attempt must be greater than or equal to 1")
+        return self._compute_delay(attempt, jitter_value=jitter_value)
+
+    def retry_delay_seconds(self, attempt: int, total_wait_seconds: float) -> Optional[float]:
+        delay_seconds = self.delay_seconds(attempt)
+        if self.max_delay is not None and total_wait_seconds + delay_seconds > self.max_delay:
+            return None
+        return delay_seconds
+
+    def exception_category(self, exception: BaseException) -> str:
+        exception_names = {type(exception).__name__}
+        exception_names.update(base.__name__ for base in type(exception).__mro__)
+        if exception_names.intersection(self.timeout_exception_types) or any("Timeout" in name for name in exception_names):
+            return "timeout"
+        if any("Connect" in name or "Connection" in name for name in exception_names):
+            return "connection"
+        return "exception"
+
+    def status_category(self, status_code: Optional[int]) -> str:
+        if status_code == 429:
+            return "rate_limit"
+        if status_code == 408:
+            return "timeout"
+        if status_code is not None and 500 <= status_code <= 599:
+            return "server_error"
+        return "status"
+
+
 class HTTPResponseResult(GenericResult[Any]):
     status_code: int
     headers: Dict[str, str] = Field(default_factory=dict)
@@ -73,6 +153,8 @@ class HTTPResponseResult(GenericResult[Any]):
     attempts: int = 1
     pages: int = 1
     rate_limit: Dict[str, str] = Field(default_factory=dict)
+    retry_events: List[Dict[str, Any]] = Field(default_factory=list)
+    retry_summary: Dict[str, int] = Field(default_factory=dict)
 
 
 class HTTPResult(HTTPResponseResult): ...
@@ -93,7 +175,8 @@ class HTTPModel(CallableModel):
     content: Optional[Union[bytes, str]] = None
     max_attempts: int = 1
     retry_status_codes: List[int] = Field(default_factory=lambda: [429, 500, 502, 503, 504])
-    retry_policy: Optional[RetryPolicy] = None
+    retry_policy: Optional[HTTPRetryPolicy] = None
+    execution_policy: Optional[ExecutionPolicy] = None
     paginate: bool = False
     max_pages: int = 100
     pagination_mode: HTTPPaginationMode = "next_url"
@@ -229,8 +312,35 @@ class HTTPModel(CallableModel):
                 rate_limit[normalized_key] = value
         return rate_limit
 
-    def _retry_policy(self) -> RetryPolicy:
-        return self.retry_policy or RetryPolicy(max_attempts=self.max_attempts, retry_status_codes=self.retry_status_codes)
+    def _retry_policy(self) -> HTTPRetryPolicy:
+        return self.retry_policy or HTTPRetryPolicy(max_attempts=self.max_attempts, retry_status_codes=self.retry_status_codes)
+
+    def _sleep(self, delay_seconds: float) -> None:
+        if delay_seconds > 0:
+            sleep(delay_seconds)
+
+    def _now(self) -> float:
+        return monotonic()
+
+    def _throttle(self, previous_started_at: Optional[float]) -> float:
+        now = self._now()
+        if self.execution_policy is None:
+            return now
+        delay_seconds = self.execution_policy.rate_delay_seconds(previous_started_at=previous_started_at, now=now)
+        if delay_seconds > 0:
+            self._sleep(delay_seconds)
+        return now + delay_seconds
+
+    def _retry_event(self, **values: Any) -> Dict[str, Any]:
+        return HTTPRetryEvent(**values).model_dump(exclude={"type_"}, exclude_none=True)
+
+    def _retry_summary(self, events: List[Dict[str, Any]], attempts: int, succeeded: bool) -> Dict[str, int]:
+        return {
+            "attempts": attempts,
+            "retried": sum(1 for event in events if event["outcome"] == "retry"),
+            "failed": sum(1 for event in events if event["outcome"] == "failed"),
+            "succeeded": 1 if succeeded else 0,
+        }
 
     def _extract_field(self, value: Any, field: str) -> Any:
         current = value
@@ -240,11 +350,16 @@ class HTTPModel(CallableModel):
             current = current.get(part)
         return current
 
-    def _request_once(self, client: httpx.Client, request: HTTPRequest) -> Tuple[httpx.Response, int]:
+    def _request_once(
+        self, client: httpx.Client, request: HTTPRequest, previous_started_at: Optional[float]
+    ) -> Tuple[httpx.Response, int, List[Dict[str, Any]], float]:
         attempts = 0
+        events: List[Dict[str, Any]] = []
         retry_policy = self._retry_policy()
+        total_retry_wait_seconds = 0.0
         while True:
             attempts += 1
+            previous_started_at = self._throttle(previous_started_at)
             try:
                 response = client.request(
                     method=request.method,
@@ -255,16 +370,62 @@ class HTTPModel(CallableModel):
                     content=request.content,
                 )
                 response.raise_for_status()
-                return response, attempts
+                return response, attempts, events, previous_started_at
             except httpx.HTTPStatusError as exc:
                 status_code = exc.response.status_code if exc.response is not None else None
                 if retry_policy.should_retry_status(status_code, attempts):
-                    continue
+                    delay_seconds = retry_policy.retry_delay_seconds(attempts, total_wait_seconds=total_retry_wait_seconds)
+                    if delay_seconds is not None:
+                        events.append(
+                            self._retry_event(
+                                attempt=attempts,
+                                outcome="retry",
+                                delay_seconds=delay_seconds,
+                                status_code=status_code,
+                                category=retry_policy.status_category(status_code),
+                                message=f"retryable status code {status_code}",
+                            )
+                        )
+                        self._sleep(delay_seconds)
+                        total_retry_wait_seconds += delay_seconds
+                        continue
+                events.append(
+                    self._retry_event(
+                        attempt=attempts,
+                        outcome="failed",
+                        status_code=status_code,
+                        category=retry_policy.status_category(status_code),
+                        message=f"retryable status code {status_code}",
+                    )
+                )
                 status_label = status_code if status_code is not None else "unknown"
                 raise RuntimeError(f"HTTP {request.method} {self._safe_url(request)} failed with status {status_label}") from exc
             except (httpx.TimeoutException, httpx.ConnectError) as exc:
                 if retry_policy.should_retry_exception(exc, attempts):
-                    continue
+                    delay_seconds = retry_policy.retry_delay_seconds(attempts, total_wait_seconds=total_retry_wait_seconds)
+                    if delay_seconds is not None:
+                        events.append(
+                            self._retry_event(
+                                attempt=attempts,
+                                outcome="retry",
+                                delay_seconds=delay_seconds,
+                                exception_type=type(exc).__name__,
+                                category=retry_policy.exception_category(exc),
+                                message=str(exc),
+                            )
+                        )
+                        self._sleep(delay_seconds)
+                        total_retry_wait_seconds += delay_seconds
+                        continue
+                events.append(
+                    self._retry_event(
+                        attempt=attempts,
+                        outcome="failed",
+                        exception_type=type(exc).__name__,
+                        category=retry_policy.exception_category(exc),
+                        message=str(exc),
+                    )
+                )
                 raise RuntimeError(f"HTTP {request.method} {self._safe_url(request)} failed with {type(exc).__name__}") from exc
             except httpx.HTTPError as exc:
                 raise RuntimeError(f"HTTP {request.method} {self._safe_url(request)} failed with {type(exc).__name__}") from exc
@@ -286,6 +447,19 @@ class HTTPModel(CallableModel):
 
     def _request_with_params(self, request: HTTPRequest, params: Dict[str, Any]) -> HTTPRequest:
         return request.model_copy(update={"params": {**request.params, **params}})
+
+    def _is_sensitive_query_param(self, key: str) -> bool:
+        normalized_key = key.lower().replace("_", "").replace("-", "")
+        return normalized_key in {"apikey", "authorization", "password"} or "token" in normalized_key or "secret" in normalized_key
+
+    def _next_url_request(self, request: HTTPRequest, next_url: str) -> HTTPRequest:
+        next_url_parts = urlsplit(next_url)
+        next_url_params = dict(parse_qsl(next_url_parts.query, keep_blank_values=True))
+        for key, value in request.params.items():
+            if key not in next_url_params and self._is_sensitive_query_param(key):
+                next_url_params[key] = value
+        next_url_without_query = urlunsplit((next_url_parts.scheme, next_url_parts.netloc, next_url_parts.path, "", next_url_parts.fragment))
+        return request.model_copy(update={"url": next_url_without_query, "params": next_url_params})
 
     def _initial_paginated_request(self, request: HTTPRequest) -> HTTPRequest:
         if not self.paginate:
@@ -316,7 +490,7 @@ class HTTPModel(CallableModel):
         match self.pagination_mode:
             case "next_url":
                 next_url = self._extract_field(value, self.next_url_field) if isinstance(value, dict) else None
-                return request.model_copy(update={"url": next_url, "params": {}}) if next_url else None
+                return self._next_url_request(request, next_url) if next_url else None
             case "cursor":
                 next_cursor = self._extract_field(value, self.next_cursor_field)
                 return self._request_with_params(request, {self.cursor_param: next_cursor}) if next_cursor else None
@@ -336,11 +510,14 @@ class HTTPModel(CallableModel):
 
         with httpx.Client(**self._client_kwargs()) as client:
             values = []
+            retry_events = []
             total_attempts = 0
             pages = 0
+            previous_started_at = None
             while True:
-                response, attempts = self._request_once(client, request)
+                response, attempts, events, previous_started_at = self._request_once(client, request, previous_started_at)
                 total_attempts += attempts
+                retry_events.extend(events)
                 pages += 1
                 value = self._response_value(response)
                 values.append(value)
@@ -360,4 +537,6 @@ class HTTPModel(CallableModel):
                 attempts=total_attempts,
                 pages=pages,
                 rate_limit=self._rate_limit_headers(dict(response.headers or {})),
+                retry_events=retry_events,
+                retry_summary=self._retry_summary(retry_events, attempts=total_attempts, succeeded=True),
             )

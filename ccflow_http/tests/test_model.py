@@ -7,9 +7,9 @@ from typing import Any
 
 import httpx
 import pytest
-from ccflow_etl import RetryPolicy
+from ccflow_etl import ExecutionPolicy
 
-from ccflow_http import HTTPAuth, HTTPConfig, HTTPModel, HTTPRequestContext, HTTPResponseResult
+from ccflow_http import HTTPAuth, HTTPConfig, HTTPModel, HTTPRequest, HTTPRequestContext, HTTPResponseResult, HTTPRetryPolicy, safe_request_dump
 
 
 @dataclass
@@ -102,6 +102,24 @@ def test_http_model_can_explain_request_without_network():
     assert request.params == {"date": "2024-01-03"}
 
 
+def test_safe_request_dump_redacts_secret_params_and_headers():
+    request = HTTPRequest(
+        method="GET",
+        url="/v1/tickers/AAA",
+        params={"date": "2024-01-03", "apiKey": "query-secret", "page_token": "cursor-secret"},
+        headers={"Authorization": "Bearer header-secret", "X-Request-ID": "abc"},
+    )
+
+    assert safe_request_dump(request) == {
+        "method": "GET",
+        "url": "/v1/tickers/AAA",
+        "params": {"date": "2024-01-03", "apiKey": "***", "page_token": "***"},
+        "headers": {"Authorization": "***", "X-Request-ID": "abc"},
+        "json_data": None,
+        "content": None,
+    }
+
+
 def test_http_model_error_message_omits_secret_query_values(monkeypatch):
     class FakeClient:
         def __init__(self, **kwargs):
@@ -183,9 +201,119 @@ def test_http_model_consumes_shared_retry_policy(monkeypatch):
 
     monkeypatch.setattr("ccflow_http.base.httpx.Client", FakeClient)
 
-    model = HTTPModel(base_url="https://api.example.test", path="/v1/tickers", retry_policy=RetryPolicy(max_attempts=2, retry_status_codes=[503]))
+    model = HTTPModel(base_url="https://api.example.test", path="/v1/tickers", retry_policy=HTTPRetryPolicy(max_attempts=2, retry_status_codes=[503]))
 
     assert model(HTTPRequestContext()).attempts == 2
+
+
+def test_http_model_consumes_shared_retry_delay_and_execution_policy(monkeypatch):
+    calls = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def request(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                request = httpx.Request("GET", "https://api.example.test/v1/tickers")
+                response = httpx.Response(429, request=request)
+                raise httpx.HTTPStatusError("rate limited", request=request, response=response)
+            return FakeResponse(value={"status": "OK"})
+
+    monkeypatch.setattr("ccflow_http.base.httpx.Client", FakeClient)
+
+    model = HTTPModel(
+        base_url="https://api.example.test",
+        path="/v1/tickers",
+        retry_policy=HTTPRetryPolicy(max_attempts=2, retry_status_codes=[429], wait_initial=1.25),
+        execution_policy=ExecutionPolicy(requests_per_interval=1, interval_seconds=2.0),
+    )
+    sleeps = []
+    request_times = iter([100.0, 101.25])
+    monkeypatch.setattr(model, "_sleep", sleeps.append)
+    monkeypatch.setattr(model, "_now", lambda: next(request_times))
+
+    result = model(HTTPRequestContext())
+
+    assert len(calls) == 2
+    assert sleeps == [1.25, 0.75]
+    assert result.retry_events == [
+        {
+            "attempt": 1,
+            "outcome": "retry",
+            "delay_seconds": 1.25,
+            "status_code": 429,
+            "category": "rate_limit",
+            "message": "retryable status code 429",
+        }
+    ]
+    assert result.retry_summary == {"attempts": 2, "retried": 1, "failed": 0, "succeeded": 1}
+
+
+def test_http_model_retries_timeout_exception(monkeypatch):
+    calls = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def request(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise httpx.TimeoutException("timed out")
+            return FakeResponse(value={"status": "OK"})
+
+    monkeypatch.setattr("ccflow_http.base.httpx.Client", FakeClient)
+
+    result = HTTPModel(base_url="https://api.example.test", path="/v1/tickers", max_attempts=2)(HTTPRequestContext())
+
+    assert len(calls) == 2
+    assert result.value == {"status": "OK"}
+    assert result.attempts == 2
+
+
+def test_http_model_retries_5xx_until_attempts_are_exhausted(monkeypatch):
+    calls = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def request(self, **kwargs):
+            calls.append(kwargs)
+            request = httpx.Request("GET", "https://api.example.test/v1/tickers?apiKey=secret")
+            response = httpx.Response(500, request=request)
+            raise httpx.HTTPStatusError("server error with apiKey=secret", request=request, response=response)
+
+    monkeypatch.setattr("ccflow_http.base.httpx.Client", FakeClient)
+
+    model = HTTPModel(base_url="https://api.example.test", path="/v1/tickers", query={"apiKey": "secret"}, max_attempts=2)
+
+    with pytest.raises(RuntimeError, match="HTTP GET /v1/tickers failed with status 500") as error:
+        model(HTTPRequestContext())
+
+    assert len(calls) == 2
+    assert "secret" not in str(error.value)
+    assert "apiKey" not in str(error.value)
 
 
 def test_http_model_paginates_massive_style_next_url(monkeypatch):
@@ -211,9 +339,67 @@ def test_http_model_paginates_massive_style_next_url(monkeypatch):
 
     result = HTTPModel(base_url="https://api.example.test", path="/v3/reference/tickers", paginate=True)(HTTPRequestContext())
 
-    assert [call["url"] for call in calls] == ["/v3/reference/tickers", "/v3/reference/tickers?cursor=2"]
+    assert [call["url"] for call in calls] == ["/v3/reference/tickers", "/v3/reference/tickers"]
+    assert calls[1]["params"] == {"cursor": "2"}
     assert result.value["results"] == [{"ticker": "AAA"}, {"ticker": "BBB"}]
     assert result.pages == 2
+
+
+def test_http_model_preserves_query_auth_for_next_url_pagination(monkeypatch):
+    calls = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def request(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return FakeResponse(value={"results": [{"ticker": "AAA"}], "next_url": "/v3/reference/tickers?cursor=2"})
+            return FakeResponse(value={"results": [{"ticker": "BBB"}]})
+
+    monkeypatch.setattr("ccflow_http.base.httpx.Client", FakeClient)
+
+    HTTPModel(
+        base_url="https://api.example.test",
+        path="/v3/reference/tickers",
+        query={"apiKey": "secret"},
+        paginate=True,
+    )(HTTPRequestContext())
+
+    assert calls[1]["url"] == "/v3/reference/tickers"
+    assert calls[1]["params"] == {"cursor": "2", "apiKey": "secret"}
+
+
+def test_http_model_sends_next_url_query_and_preserved_auth_with_httpx_transport():
+    seen_urls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_urls.append(str(request.url))
+        if len(seen_urls) == 1:
+            return httpx.Response(200, json={"results": [{"ticker": "AAA"}], "next_url": "/v3/reference/tickers?cursor=2"})
+        return httpx.Response(200, json={"results": [{"ticker": "BBB"}]})
+
+    model = HTTPModel(
+        config=HTTPConfig(base_url="https://api.example.test", transport=httpx.MockTransport(handler)),
+        path="/v3/reference/tickers",
+        query={"apiKey": "secret"},
+        paginate=True,
+    )
+
+    result = model(HTTPRequestContext())
+
+    assert seen_urls == [
+        "https://api.example.test/v3/reference/tickers?apiKey=secret",
+        "https://api.example.test/v3/reference/tickers?cursor=2&apiKey=secret",
+    ]
+    assert result.value["results"] == [{"ticker": "AAA"}, {"ticker": "BBB"}]
 
 
 def test_http_model_applies_config_and_all_auth_strategies_with_mock_transport():
