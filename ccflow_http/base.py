@@ -3,7 +3,7 @@ from csv import DictReader
 from gzip import decompress
 from io import StringIO
 from time import monotonic, sleep
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Literal
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 import httpx
@@ -14,15 +14,15 @@ from jinja2 import Environment
 from pydantic import Field
 
 __all__ = (
-    "HTTPConfig",
     "HTTPAuth",
+    "HTTPConfig",
     "HTTPContext",
-    "HTTPRequestContext",
+    "HTTPModel",
     "HTTPRequest",
-    "HTTPRetryPolicy",
+    "HTTPRequestContext",
     "HTTPResponseResult",
     "HTTPResult",
-    "HTTPModel",
+    "HTTPRetryPolicy",
     "redact_mapping",
     "safe_request_dump",
 )
@@ -38,27 +38,27 @@ class HTTPConfig(BaseModel):
     base_url: str = ""
     timeout: float = 30.0
     follow_redirects: bool = True
-    headers: Dict[str, str] = Field(default_factory=dict)
-    transport: Optional[Any] = None
+    headers: dict[str, str] = Field(default_factory=dict)
+    transport: Any | None = None
 
 
 class HTTPAuth(BaseModel):
     strategy: HTTPAuthStrategy = "none"
-    token: Optional[str] = None
-    name: Optional[str] = None
-    value: Optional[str] = None
-    username: Optional[str] = None
-    password: Optional[str] = None
+    token: str | None = None
+    name: str | None = None
+    value: str | None = None
+    username: str | None = None
+    password: str | None = None
     scheme: str = "Bearer"
 
 
 class HTTPContext(ContextBase):
-    path: Optional[str] = None
-    query: Dict[str, Any] = Field(default_factory=dict)
-    headers: Dict[str, str] = Field(default_factory=dict)
-    template_values: Dict[str, Any] = Field(default_factory=dict)
-    json_body: Optional[Any] = None
-    content: Optional[Union[bytes, str]] = None
+    path: str | None = None
+    query: dict[str, Any] = Field(default_factory=dict)
+    headers: dict[str, str] = Field(default_factory=dict)
+    template_values: dict[str, Any] = Field(default_factory=dict)
+    json_body: Any | None = None
+    content: bytes | str | None = None
 
 
 class HTTPRequestContext(HTTPContext): ...
@@ -67,13 +67,13 @@ class HTTPRequestContext(HTTPContext): ...
 class HTTPRequest(BaseModel):
     method: HTTPMethod
     url: str
-    params: Dict[str, Any] = Field(default_factory=dict)
-    headers: Dict[str, str] = Field(default_factory=dict)
-    json_data: Optional[Any] = None
-    content: Optional[Union[bytes, str]] = None
+    params: dict[str, Any] = Field(default_factory=dict)
+    headers: dict[str, str] = Field(default_factory=dict)
+    json_data: Any | None = None
+    content: bytes | str | None = None
 
 
-def redact_mapping(values: Dict[str, Any]) -> Dict[str, Any]:
+def redact_mapping(values: dict[str, Any]) -> dict[str, Any]:
     redacted = {}
     for key, value in values.items():
         normalized_key = key.lower().replace("_", "").replace("-", "")
@@ -84,7 +84,7 @@ def redact_mapping(values: Dict[str, Any]) -> Dict[str, Any]:
     return redacted
 
 
-def safe_request_dump(request: HTTPRequest) -> Dict[str, Any]:
+def safe_request_dump(request: HTTPRequest) -> dict[str, Any]:
     request_data = request.model_dump(exclude={"type_"})
     request_data["params"] = redact_mapping(request_data.get("params", {}))
     request_data["headers"] = redact_mapping(request_data.get("headers", {}))
@@ -95,33 +95,33 @@ class HTTPRetryEvent(BaseModel):
     attempt: int
     outcome: HTTPRetryOutcome
     delay_seconds: float = 0.0
-    status_code: Optional[int] = None
-    exception_type: Optional[str] = None
-    category: Optional[str] = None
-    message: Optional[str] = None
+    status_code: int | None = None
+    exception_type: str | None = None
+    category: str | None = None
+    message: str | None = None
 
 
 class HTTPRetryPolicy(RetryPolicy):
-    retry_status_codes: List[int] = Field(default_factory=lambda: [429, 500, 502, 503, 504])
-    retry_exceptions: List[PyObjectPath] = Field(
+    retry_status_codes: list[int] = Field(default_factory=lambda: [429, 500, 502, 503, 504])
+    retry_exceptions: list[PyObjectPath] = Field(
         default_factory=lambda: [PyObjectPath.validate(httpx.TimeoutException), PyObjectPath.validate(httpx.ConnectError)]
     )
-    timeout_exception_types: List[str] = Field(
+    timeout_exception_types: list[str] = Field(
         default_factory=lambda: ["TimeoutError", "TimeoutException", "ConnectTimeout", "ReadTimeout", "WriteTimeout", "PoolTimeout"]
     )
 
-    def should_retry_status(self, status_code: Optional[int], attempt: int) -> bool:
+    def should_retry_status(self, status_code: int | None, attempt: int) -> bool:
         return status_code in self.retry_status_codes and attempt < self.max_attempts
 
     def should_retry_exception(self, exception: BaseException, attempt: int) -> bool:
         return self._should_retry(exception) and attempt < self.max_attempts
 
-    def delay_seconds(self, attempt: int, jitter_value: Optional[float] = None) -> float:
+    def delay_seconds(self, attempt: int, jitter_value: float | None = None) -> float:
         if attempt < 1:
             raise ValueError("attempt must be greater than or equal to 1")
         return self._compute_delay(attempt, jitter_value=jitter_value)
 
-    def retry_delay_seconds(self, attempt: int, total_wait_seconds: float) -> Optional[float]:
+    def retry_delay_seconds(self, attempt: int, total_wait_seconds: float) -> float | None:
         delay_seconds = self.delay_seconds(attempt)
         if self.max_delay is not None and total_wait_seconds + delay_seconds > self.max_delay:
             return None
@@ -136,7 +136,7 @@ class HTTPRetryPolicy(RetryPolicy):
             return "connection"
         return "exception"
 
-    def status_category(self, status_code: Optional[int]) -> str:
+    def status_category(self, status_code: int | None) -> str:
         if status_code == 429:
             return "rate_limit"
         if status_code == 408:
@@ -148,48 +148,48 @@ class HTTPRetryPolicy(RetryPolicy):
 
 class HTTPResponseResult(GenericResult[Any]):
     status_code: int
-    headers: Dict[str, str] = Field(default_factory=dict)
+    headers: dict[str, str] = Field(default_factory=dict)
     url: str = ""
     attempts: int = 1
     pages: int = 1
-    rate_limit: Dict[str, str] = Field(default_factory=dict)
-    retry_events: List[Dict[str, Any]] = Field(default_factory=list)
-    retry_summary: Dict[str, int] = Field(default_factory=dict)
+    rate_limit: dict[str, str] = Field(default_factory=dict)
+    retry_events: list[dict[str, Any]] = Field(default_factory=list)
+    retry_summary: dict[str, int] = Field(default_factory=dict)
 
 
 class HTTPResult(HTTPResponseResult): ...
 
 
 class HTTPModel(CallableModel):
-    config: Optional[HTTPConfig] = None
+    config: HTTPConfig | None = None
     auth: HTTPAuth = Field(default_factory=HTTPAuth)
     method: HTTPMethod = "GET"
     base_url: str = ""
     path: str = ""
-    query: Dict[str, Any] = Field(default_factory=dict)
-    headers: Dict[str, str] = Field(default_factory=dict)
+    query: dict[str, Any] = Field(default_factory=dict)
+    headers: dict[str, str] = Field(default_factory=dict)
     timeout: float = 30.0
     follow_redirects: bool = True
     response_format: ResponseFormat = "json"
-    json_body: Optional[Any] = None
-    content: Optional[Union[bytes, str]] = None
+    json_body: Any | None = None
+    content: bytes | str | None = None
     max_attempts: int = 1
-    retry_status_codes: List[int] = Field(default_factory=lambda: [429, 500, 502, 503, 504])
-    retry_policy: Optional[HTTPRetryPolicy] = None
-    execution_policy: Optional[ExecutionPolicy] = None
+    retry_status_codes: list[int] = Field(default_factory=lambda: [429, 500, 502, 503, 504])
+    retry_policy: HTTPRetryPolicy | None = None
+    execution_policy: ExecutionPolicy | None = None
     paginate: bool = False
     max_pages: int = 100
     pagination_mode: HTTPPaginationMode = "next_url"
     next_url_field: str = "next_url"
     next_cursor_field: str = "next_cursor"
     cursor_param: str = "cursor"
-    cursor_start: Optional[str] = None
+    cursor_start: str | None = None
     page_param: str = "page"
     page_start: int = 1
     offset_param: str = "offset"
     offset_start: int = 0
     limit_param: str = "limit"
-    limit: Optional[int] = None
+    limit: int | None = None
     results_field: str = "results"
 
     @property
@@ -200,25 +200,25 @@ class HTTPModel(CallableModel):
     def result_type(self):
         return HTTPResult
 
-    def _template_data(self, context: HTTPContext) -> Dict[str, Any]:
+    def _template_data(self, context: HTTPContext) -> dict[str, Any]:
         data = context.model_dump(exclude_none=True)
         data.update(context.template_values)
         return data
 
-    def _render(self, value: Any, data: Dict[str, Any]) -> Any:
+    def _render(self, value: Any, data: dict[str, Any]) -> Any:
         if isinstance(value, str):
             return Environment().from_string(value).render(**data)
         return value
 
-    def _render_mapping(self, values: Dict[str, Any], data: Dict[str, Any]) -> Dict[str, Any]:
+    def _render_mapping(self, values: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
         return {key: self._render(value, data) for key, value in values.items() if value is not None}
 
-    def _render_required_auth_value(self, value: Optional[str], field_name: str, data: Dict[str, Any]) -> str:
+    def _render_required_auth_value(self, value: str | None, field_name: str, data: dict[str, Any]) -> str:
         if value is None:
             raise ValueError(f"HTTP auth strategy {self.auth.strategy!r} requires {field_name}.")
         return str(self._render(value, data))
 
-    def _apply_auth(self, headers: Dict[str, str], query: Dict[str, Any], data: Dict[str, Any]) -> None:
+    def _apply_auth(self, headers: dict[str, str], query: dict[str, Any], data: dict[str, Any]) -> None:
         match self.auth.strategy:
             case "none":
                 return
@@ -236,7 +236,7 @@ class HTTPModel(CallableModel):
             case "basic":
                 username = self._render_required_auth_value(self.auth.username, "username", data)
                 password = self._render_required_auth_value(self.auth.password, "password", data)
-                encoded = b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+                encoded = b64encode(f"{username}:{password}".encode()).decode("ascii")
                 headers["Authorization"] = f"Basic {encoded}"
             case _:
                 raise ValueError(f"Unsupported HTTP auth strategy: {self.auth.strategy}")
@@ -254,7 +254,7 @@ class HTTPModel(CallableModel):
             return self.config.follow_redirects
         return self.follow_redirects
 
-    def _client_kwargs(self) -> Dict[str, Any]:
+    def _client_kwargs(self) -> dict[str, Any]:
         kwargs = {
             "base_url": self._base_url(),
             "timeout": self._timeout(),
@@ -264,7 +264,7 @@ class HTTPModel(CallableModel):
             kwargs["transport"] = self.config.transport
         return kwargs
 
-    def build_request(self, context: Optional[HTTPContext] = None) -> HTTPRequest:
+    def build_request(self, context: HTTPContext | None = None) -> HTTPRequest:
         context = context or HTTPRequestContext()
         data = self._template_data(context)
 
@@ -304,7 +304,7 @@ class HTTPModel(CallableModel):
     def _safe_url(self, request: HTTPRequest) -> str:
         return request.url.split("?", 1)[0]
 
-    def _rate_limit_headers(self, headers: Dict[str, str]) -> Dict[str, str]:
+    def _rate_limit_headers(self, headers: dict[str, str]) -> dict[str, str]:
         rate_limit = {}
         for key, value in headers.items():
             normalized_key = key.lower()
@@ -322,7 +322,7 @@ class HTTPModel(CallableModel):
     def _now(self) -> float:
         return monotonic()
 
-    def _throttle(self, previous_started_at: Optional[float]) -> float:
+    def _throttle(self, previous_started_at: float | None) -> float:
         now = self._now()
         if self.execution_policy is None:
             return now
@@ -331,10 +331,10 @@ class HTTPModel(CallableModel):
             self._sleep(delay_seconds)
         return now + delay_seconds
 
-    def _retry_event(self, **values: Any) -> Dict[str, Any]:
+    def _retry_event(self, **values: Any) -> dict[str, Any]:
         return HTTPRetryEvent(**values).model_dump(exclude={"type_"}, exclude_none=True)
 
-    def _retry_summary(self, events: List[Dict[str, Any]], attempts: int, succeeded: bool) -> Dict[str, int]:
+    def _retry_summary(self, events: list[dict[str, Any]], attempts: int, succeeded: bool) -> dict[str, int]:
         return {
             "attempts": attempts,
             "retried": sum(1 for event in events if event["outcome"] == "retry"),
@@ -351,10 +351,10 @@ class HTTPModel(CallableModel):
         return current
 
     def _request_once(
-        self, client: httpx.Client, request: HTTPRequest, previous_started_at: Optional[float]
-    ) -> Tuple[httpx.Response, int, List[Dict[str, Any]], float]:
+        self, client: httpx.Client, request: HTTPRequest, previous_started_at: float | None
+    ) -> tuple[httpx.Response, int, list[dict[str, Any]], float]:
         attempts = 0
-        events: List[Dict[str, Any]] = []
+        events: list[dict[str, Any]] = []
         retry_policy = self._retry_policy()
         total_retry_wait_seconds = 0.0
         while True:
@@ -430,7 +430,7 @@ class HTTPModel(CallableModel):
             except httpx.HTTPError as exc:
                 raise RuntimeError(f"HTTP {request.method} {self._safe_url(request)} failed with {type(exc).__name__}") from exc
 
-    def _merge_page_values(self, values: List[Any]) -> Any:
+    def _merge_page_values(self, values: list[Any]) -> Any:
         if not values:
             return []
         if all(isinstance(value, dict) and isinstance(value.get(self.results_field), list) for value in values):
@@ -441,11 +441,11 @@ class HTTPModel(CallableModel):
             return merged
         return values
 
-    def _page_items(self, value: Any) -> Optional[List[Any]]:
+    def _page_items(self, value: Any) -> list[Any] | None:
         items = self._extract_field(value, self.results_field)
         return items if isinstance(items, list) else None
 
-    def _request_with_params(self, request: HTTPRequest, params: Dict[str, Any]) -> HTTPRequest:
+    def _request_with_params(self, request: HTTPRequest, params: dict[str, Any]) -> HTTPRequest:
         return request.model_copy(update={"params": {**request.params, **params}})
 
     def _is_sensitive_query_param(self, key: str) -> bool:
@@ -484,7 +484,7 @@ class HTTPModel(CallableModel):
             case _:
                 raise ValueError(f"Unsupported pagination mode: {self.pagination_mode}")
 
-    def _next_paginated_request(self, request: HTTPRequest, value: Any) -> Optional[HTTPRequest]:
+    def _next_paginated_request(self, request: HTTPRequest, value: Any) -> HTTPRequest | None:
         if self._page_items(value) == []:
             return None
         match self.pagination_mode:
