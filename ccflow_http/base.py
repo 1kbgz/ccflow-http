@@ -1,5 +1,7 @@
 from base64 import b64encode
 from csv import DictReader
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from gzip import decompress
 from io import StringIO
 from time import monotonic, sleep
@@ -109,9 +111,30 @@ class HTTPRetryPolicy(RetryPolicy):
     timeout_exception_types: list[str] = Field(
         default_factory=lambda: ["TimeoutError", "TimeoutException", "ConnectTimeout", "ReadTimeout", "WriteTimeout", "PoolTimeout"]
     )
+    retry_after_max: float | None = Field(
+        default=300.0,
+        ge=0.0,
+        description="Cap (in seconds) on honoring a server-provided Retry-After header. None honors it unbounded.",
+    )
 
     def should_retry_status(self, status_code: int | None, attempt: int) -> bool:
         return status_code in self.retry_status_codes and attempt < self.max_attempts
+
+    def retry_after_seconds(self, headers: dict[str, str]) -> float | None:
+        value = next((v for k, v in headers.items() if k.lower() == "retry-after"), None)
+        if value is None:
+            return None
+        try:
+            delay_seconds = float(value)
+        except ValueError:
+            try:
+                delay_seconds = (parsedate_to_datetime(value) - datetime.now(UTC)).total_seconds()
+            except (TypeError, ValueError):
+                return None
+        delay_seconds = max(delay_seconds, 0.0)
+        if self.retry_after_max is not None:
+            delay_seconds = min(delay_seconds, self.retry_after_max)
+        return delay_seconds
 
     def should_retry_exception(self, exception: BaseException, attempt: int) -> bool:
         return self._should_retry(exception) and attempt < self.max_attempts
@@ -376,6 +399,9 @@ class HTTPModel(CallableModel):
                 if retry_policy.should_retry_status(status_code, attempts):
                     delay_seconds = retry_policy.retry_delay_seconds(attempts, total_wait_seconds=total_retry_wait_seconds)
                     if delay_seconds is not None:
+                        retry_after = retry_policy.retry_after_seconds(dict(exc.response.headers or {})) if exc.response is not None else None
+                        if retry_after is not None:
+                            delay_seconds = max(delay_seconds, retry_after)
                         events.append(
                             self._retry_event(
                                 attempt=attempts,
