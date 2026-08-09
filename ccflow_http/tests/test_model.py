@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from base64 import b64decode
 from dataclasses import dataclass
+from datetime import UTC
 from gzip import compress
 from typing import Any
 
@@ -522,3 +523,136 @@ def test_http_model_supports_cursor_page_and_offset_pagination_with_mock_transpo
     assert page_result.value["results"] == [{"id": 1}, {"id": 2}]
     assert offset_requests == [{"offset": "0", "limit": "2"}, {"offset": "2", "limit": "2"}, {"offset": "4", "limit": "2"}]
     assert offset_result.value["results"] == [{"id": 1}, {"id": 2}]
+
+
+def _retrying_client(calls, response_factory):
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def request(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                response_factory()
+            return FakeResponse(value={"status": "OK"})
+
+    return FakeClient
+
+
+def _raise_status(status_code, headers=None):
+    request = httpx.Request("GET", "https://api.example.test/v1/tickers")
+    response = httpx.Response(status_code, request=request, headers=headers or {})
+    raise httpx.HTTPStatusError("error", request=request, response=response)
+
+
+def test_http_model_retries_connect_error(monkeypatch):
+    calls = []
+
+    def fail_once():
+        raise httpx.ConnectError("connection failed")
+
+    monkeypatch.setattr("ccflow_http.base.httpx.Client", _retrying_client(calls, fail_once))
+
+    result = HTTPModel(base_url="https://api.example.test", path="/v1/tickers", max_attempts=2)(HTTPRequestContext())
+
+    assert len(calls) == 2
+    assert result.attempts == 2
+    assert result.retry_events[0]["category"] == "connection"
+
+
+def test_http_model_honors_retry_after_seconds_over_backoff(monkeypatch):
+    calls = []
+    monkeypatch.setattr("ccflow_http.base.httpx.Client", _retrying_client(calls, lambda: _raise_status(429, {"retry-after": "45"})))
+
+    model = HTTPModel(
+        base_url="https://api.example.test",
+        path="/v1/tickers",
+        retry_policy=HTTPRetryPolicy(max_attempts=2, wait_initial=1.0),
+    )
+    sleeps = []
+    monkeypatch.setattr(model, "_sleep", sleeps.append)
+
+    result = model(HTTPRequestContext())
+
+    assert len(calls) == 2
+    assert sleeps == [45.0]
+    assert result.retry_events[0]["delay_seconds"] == 45.0
+
+
+def test_http_model_uses_backoff_when_it_exceeds_retry_after(monkeypatch):
+    calls = []
+    monkeypatch.setattr("ccflow_http.base.httpx.Client", _retrying_client(calls, lambda: _raise_status(429, {"retry-after": "1"})))
+
+    model = HTTPModel(
+        base_url="https://api.example.test",
+        path="/v1/tickers",
+        retry_policy=HTTPRetryPolicy(max_attempts=2, wait_initial=5.0),
+    )
+    sleeps = []
+    monkeypatch.setattr(model, "_sleep", sleeps.append)
+
+    model(HTTPRequestContext())
+
+    assert sleeps == [5.0]
+
+
+def test_http_model_caps_retry_after_at_retry_after_max(monkeypatch):
+    calls = []
+    monkeypatch.setattr("ccflow_http.base.httpx.Client", _retrying_client(calls, lambda: _raise_status(429, {"retry-after": "9999"})))
+
+    model = HTTPModel(
+        base_url="https://api.example.test",
+        path="/v1/tickers",
+        retry_policy=HTTPRetryPolicy(max_attempts=2, wait_initial=1.0, retry_after_max=300.0),
+    )
+    sleeps = []
+    monkeypatch.setattr(model, "_sleep", sleeps.append)
+
+    model(HTTPRequestContext())
+
+    assert sleeps == [300.0]
+
+
+def test_http_model_honors_retry_after_http_date(monkeypatch):
+    from datetime import datetime, timedelta
+    from email.utils import format_datetime
+
+    calls = []
+    retry_at = format_datetime(datetime.now(UTC) + timedelta(seconds=60))
+    monkeypatch.setattr("ccflow_http.base.httpx.Client", _retrying_client(calls, lambda: _raise_status(429, {"retry-after": retry_at})))
+
+    model = HTTPModel(
+        base_url="https://api.example.test",
+        path="/v1/tickers",
+        retry_policy=HTTPRetryPolicy(max_attempts=2, wait_initial=1.0),
+    )
+    sleeps = []
+    monkeypatch.setattr(model, "_sleep", sleeps.append)
+
+    model(HTTPRequestContext())
+
+    assert len(sleeps) == 1
+    assert 50.0 <= sleeps[0] <= 60.0
+
+
+def test_http_model_ignores_invalid_retry_after(monkeypatch):
+    calls = []
+    monkeypatch.setattr("ccflow_http.base.httpx.Client", _retrying_client(calls, lambda: _raise_status(429, {"retry-after": "soon"})))
+
+    model = HTTPModel(
+        base_url="https://api.example.test",
+        path="/v1/tickers",
+        retry_policy=HTTPRetryPolicy(max_attempts=2, wait_initial=1.0),
+    )
+    sleeps = []
+    monkeypatch.setattr(model, "_sleep", sleeps.append)
+
+    model(HTTPRequestContext())
+
+    assert sleeps == [1.0]
