@@ -551,11 +551,12 @@ def _raise_status(status_code, headers=None):
     raise httpx.HTTPStatusError("error", request=request, response=response)
 
 
-def test_http_model_retries_connect_error(monkeypatch):
+@pytest.mark.parametrize(("exception_type", "category"), [(httpx.ConnectError, "connection"), (httpx.RemoteProtocolError, "exception")])
+def test_http_model_retries_transport_error(monkeypatch, exception_type, category):
     calls = []
 
     def fail_once():
-        raise httpx.ConnectError("connection failed")
+        raise exception_type("transport failed")
 
     monkeypatch.setattr("ccflow_http.base.httpx.Client", _retrying_client(calls, fail_once))
 
@@ -563,7 +564,7 @@ def test_http_model_retries_connect_error(monkeypatch):
 
     assert len(calls) == 2
     assert result.attempts == 2
-    assert result.retry_events[0]["category"] == "connection"
+    assert result.retry_events[0]["category"] == category
 
 
 def test_http_model_honors_retry_after_seconds_over_backoff(monkeypatch):
