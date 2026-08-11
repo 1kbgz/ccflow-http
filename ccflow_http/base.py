@@ -105,9 +105,7 @@ class HTTPRetryEvent(BaseModel):
 
 class HTTPRetryPolicy(RetryPolicy):
     retry_status_codes: list[int] = Field(default_factory=lambda: [429, 500, 502, 503, 504])
-    retry_exceptions: list[PyObjectPath] = Field(
-        default_factory=lambda: [PyObjectPath.validate(httpx.TimeoutException), PyObjectPath.validate(httpx.ConnectError)]
-    )
+    retry_exceptions: list[PyObjectPath] = Field(default_factory=lambda: [PyObjectPath.validate(httpx.TransportError)])
     timeout_exception_types: list[str] = Field(
         default_factory=lambda: ["TimeoutError", "TimeoutException", "ConnectTimeout", "ReadTimeout", "WriteTimeout", "PoolTimeout"]
     )
@@ -426,7 +424,7 @@ class HTTPModel(CallableModel):
                 )
                 status_label = status_code if status_code is not None else "unknown"
                 raise RuntimeError(f"HTTP {request.method} {self._safe_url(request)} failed with status {status_label}") from exc
-            except (httpx.TimeoutException, httpx.ConnectError) as exc:
+            except httpx.TransportError as exc:
                 if retry_policy.should_retry_exception(exc, attempts):
                     delay_seconds = retry_policy.retry_delay_seconds(attempts, total_wait_seconds=total_retry_wait_seconds)
                     if delay_seconds is not None:
