@@ -6,7 +6,7 @@ from datetime import UTC
 from gzip import compress
 from typing import Any
 
-import httpx
+import httpx2
 import pytest
 from ccflow_etl import ExecutionPolicy
 
@@ -52,7 +52,7 @@ def test_http_model_renders_request_and_returns_json(monkeypatch):
             calls.append({"client": self.kwargs, "request": kwargs})
             return FakeResponse(value={"status": "OK", "results": [{"ticker": "AAA"}]}, headers={"x-limit-remaining": "9"})
 
-    monkeypatch.setattr("ccflow_http.base.httpx.Client", FakeClient)
+    monkeypatch.setattr("ccflow_http.base.httpx2.Client", FakeClient)
 
     model = HTTPModel(
         base_url="https://api.example.test",
@@ -133,11 +133,11 @@ def test_http_model_error_message_omits_secret_query_values(monkeypatch):
             return False
 
         def request(self, **kwargs):
-            request = httpx.Request("GET", "https://api.example.test/v1/tickers/AAA?apiKey=secret")
-            response = httpx.Response(429, request=request)
-            raise httpx.HTTPStatusError("rate limited with apiKey=secret", request=request, response=response)
+            request = httpx2.Request("GET", "https://api.example.test/v1/tickers/AAA?apiKey=secret")
+            response = httpx2.Response(429, request=request)
+            raise httpx2.HTTPStatusError("rate limited with apiKey=secret", request=request, response=response)
 
-    monkeypatch.setattr("ccflow_http.base.httpx.Client", FakeClient)
+    monkeypatch.setattr("ccflow_http.base.httpx2.Client", FakeClient)
 
     model = HTTPModel(base_url="https://api.example.test", path="/v1/tickers/{{ ticker }}", query={"apiKey": "{{ api_key }}"})
 
@@ -164,12 +164,12 @@ def test_http_model_retries_retryable_status_and_captures_rate_limit(monkeypatch
         def request(self, **kwargs):
             calls.append(kwargs)
             if len(calls) == 1:
-                request = httpx.Request("GET", "https://api.example.test/v1/tickers")
-                response = httpx.Response(429, request=request, headers={"retry-after": "1"})
-                raise httpx.HTTPStatusError("rate limited", request=request, response=response)
+                request = httpx2.Request("GET", "https://api.example.test/v1/tickers")
+                response = httpx2.Response(429, request=request, headers={"retry-after": "1"})
+                raise httpx2.HTTPStatusError("rate limited", request=request, response=response)
             return FakeResponse(value={"status": "OK"}, headers={"x-ratelimit-remaining": "8"})
 
-    monkeypatch.setattr("ccflow_http.base.httpx.Client", FakeClient)
+    monkeypatch.setattr("ccflow_http.base.httpx2.Client", FakeClient)
 
     result = HTTPModel(base_url="https://api.example.test", path="/v1/tickers", max_attempts=2)(HTTPRequestContext())
 
@@ -195,12 +195,12 @@ def test_http_model_consumes_shared_retry_policy(monkeypatch):
         def request(self, **kwargs):
             calls.append(kwargs)
             if len(calls) == 1:
-                request = httpx.Request("GET", "https://api.example.test/v1/tickers")
-                response = httpx.Response(503, request=request)
-                raise httpx.HTTPStatusError("unavailable", request=request, response=response)
+                request = httpx2.Request("GET", "https://api.example.test/v1/tickers")
+                response = httpx2.Response(503, request=request)
+                raise httpx2.HTTPStatusError("unavailable", request=request, response=response)
             return FakeResponse(value={"status": "OK"})
 
-    monkeypatch.setattr("ccflow_http.base.httpx.Client", FakeClient)
+    monkeypatch.setattr("ccflow_http.base.httpx2.Client", FakeClient)
 
     model = HTTPModel(base_url="https://api.example.test", path="/v1/tickers", retry_policy=HTTPRetryPolicy(max_attempts=2, retry_status_codes=[503]))
 
@@ -223,12 +223,12 @@ def test_http_model_consumes_shared_retry_delay_and_execution_policy(monkeypatch
         def request(self, **kwargs):
             calls.append(kwargs)
             if len(calls) == 1:
-                request = httpx.Request("GET", "https://api.example.test/v1/tickers")
-                response = httpx.Response(429, request=request)
-                raise httpx.HTTPStatusError("rate limited", request=request, response=response)
+                request = httpx2.Request("GET", "https://api.example.test/v1/tickers")
+                response = httpx2.Response(429, request=request)
+                raise httpx2.HTTPStatusError("rate limited", request=request, response=response)
             return FakeResponse(value={"status": "OK"})
 
-    monkeypatch.setattr("ccflow_http.base.httpx.Client", FakeClient)
+    monkeypatch.setattr("ccflow_http.base.httpx2.Client", FakeClient)
 
     model = HTTPModel(
         base_url="https://api.example.test",
@@ -274,10 +274,10 @@ def test_http_model_retries_timeout_exception(monkeypatch):
         def request(self, **kwargs):
             calls.append(kwargs)
             if len(calls) == 1:
-                raise httpx.TimeoutException("timed out")
+                raise httpx2.TimeoutException("timed out")
             return FakeResponse(value={"status": "OK"})
 
-    monkeypatch.setattr("ccflow_http.base.httpx.Client", FakeClient)
+    monkeypatch.setattr("ccflow_http.base.httpx2.Client", FakeClient)
 
     result = HTTPModel(base_url="https://api.example.test", path="/v1/tickers", max_attempts=2)(HTTPRequestContext())
 
@@ -301,11 +301,11 @@ def test_http_model_retries_5xx_until_attempts_are_exhausted(monkeypatch):
 
         def request(self, **kwargs):
             calls.append(kwargs)
-            request = httpx.Request("GET", "https://api.example.test/v1/tickers?apiKey=secret")
-            response = httpx.Response(500, request=request)
-            raise httpx.HTTPStatusError("server error with apiKey=secret", request=request, response=response)
+            request = httpx2.Request("GET", "https://api.example.test/v1/tickers?apiKey=secret")
+            response = httpx2.Response(500, request=request)
+            raise httpx2.HTTPStatusError("server error with apiKey=secret", request=request, response=response)
 
-    monkeypatch.setattr("ccflow_http.base.httpx.Client", FakeClient)
+    monkeypatch.setattr("ccflow_http.base.httpx2.Client", FakeClient)
 
     model = HTTPModel(base_url="https://api.example.test", path="/v1/tickers", query={"apiKey": "secret"}, max_attempts=2)
 
@@ -336,7 +336,7 @@ def test_http_model_paginates_massive_style_next_url(monkeypatch):
                 return FakeResponse(value={"results": [{"ticker": "AAA"}], "next_url": "/v3/reference/tickers?cursor=2"})
             return FakeResponse(value={"results": [{"ticker": "BBB"}]})
 
-    monkeypatch.setattr("ccflow_http.base.httpx.Client", FakeClient)
+    monkeypatch.setattr("ccflow_http.base.httpx2.Client", FakeClient)
 
     result = HTTPModel(base_url="https://api.example.test", path="/v3/reference/tickers", paginate=True)(HTTPRequestContext())
 
@@ -365,7 +365,7 @@ def test_http_model_preserves_query_auth_for_next_url_pagination(monkeypatch):
                 return FakeResponse(value={"results": [{"ticker": "AAA"}], "next_url": "/v3/reference/tickers?cursor=2"})
             return FakeResponse(value={"results": [{"ticker": "BBB"}]})
 
-    monkeypatch.setattr("ccflow_http.base.httpx.Client", FakeClient)
+    monkeypatch.setattr("ccflow_http.base.httpx2.Client", FakeClient)
 
     HTTPModel(
         base_url="https://api.example.test",
@@ -378,17 +378,17 @@ def test_http_model_preserves_query_auth_for_next_url_pagination(monkeypatch):
     assert calls[1]["params"] == {"cursor": "2", "apiKey": "secret"}
 
 
-def test_http_model_sends_next_url_query_and_preserved_auth_with_httpx_transport():
+def test_http_model_sends_next_url_query_and_preserved_auth_with_httpx2_transport():
     seen_urls = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         seen_urls.append(str(request.url))
         if len(seen_urls) == 1:
-            return httpx.Response(200, json={"results": [{"ticker": "AAA"}], "next_url": "/v3/reference/tickers?cursor=2"})
-        return httpx.Response(200, json={"results": [{"ticker": "BBB"}]})
+            return httpx2.Response(200, json={"results": [{"ticker": "AAA"}], "next_url": "/v3/reference/tickers?cursor=2"})
+        return httpx2.Response(200, json={"results": [{"ticker": "BBB"}]})
 
     model = HTTPModel(
-        config=HTTPConfig(base_url="https://api.example.test", transport=httpx.MockTransport(handler)),
+        config=HTTPConfig(base_url="https://api.example.test", transport=httpx2.MockTransport(handler)),
         path="/v3/reference/tickers",
         query={"apiKey": "secret"},
         paginate=True,
@@ -406,11 +406,11 @@ def test_http_model_sends_next_url_query_and_preserved_auth_with_httpx_transport
 def test_http_model_applies_config_and_all_auth_strategies_with_mock_transport():
     seen_requests = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         seen_requests.append(request)
-        return httpx.Response(200, json={"status": "OK"}, headers={"x-ratelimit-remaining": "7"})
+        return httpx2.Response(200, json={"status": "OK"}, headers={"x-ratelimit-remaining": "7"})
 
-    transport = httpx.MockTransport(handler)
+    transport = httpx2.MockTransport(handler)
     config = HTTPConfig(base_url="https://api.example.test", timeout=4.0, headers={"Accept": "application/json"}, transport=transport)
 
     bearer = HTTPModel(config=config, path="/v1/{{ resource }}", auth=HTTPAuth(strategy="bearer", token="{{ token }}"))
@@ -440,20 +440,20 @@ def test_http_model_applies_config_and_all_auth_strategies_with_mock_transport()
 
 
 def test_http_model_parses_csv_and_gzip_responses_with_mock_transport():
-    def csv_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, text="ticker,volume\nAAA,10\nBBB,20\n")
+    def csv_handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, text="ticker,volume\nAAA,10\nBBB,20\n")
 
     csv_result = HTTPModel(
-        config=HTTPConfig(base_url="https://api.example.test", transport=httpx.MockTransport(csv_handler)),
+        config=HTTPConfig(base_url="https://api.example.test", transport=httpx2.MockTransport(csv_handler)),
         path="/csv",
         response_format="csv",
     )(HTTPRequestContext())
 
-    def gzip_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=compress(b'{"status":"OK"}'))
+    def gzip_handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, content=compress(b'{"status":"OK"}'))
 
     gzip_result = HTTPModel(
-        config=HTTPConfig(base_url="https://api.example.test", transport=httpx.MockTransport(gzip_handler)),
+        config=HTTPConfig(base_url="https://api.example.test", transport=httpx2.MockTransport(gzip_handler)),
         path="/gzip",
         response_format="gzip",
     )(HTTPRequestContext())
@@ -465,14 +465,14 @@ def test_http_model_parses_csv_and_gzip_responses_with_mock_transport():
 def test_http_model_supports_cursor_page_and_offset_pagination_with_mock_transport():
     cursor_requests = []
 
-    def cursor_handler(request: httpx.Request) -> httpx.Response:
+    def cursor_handler(request: httpx2.Request) -> httpx2.Response:
         cursor_requests.append(dict(request.url.params))
         if "cursor" not in request.url.params:
-            return httpx.Response(200, json={"results": [{"id": 1}], "next_cursor": "abc"})
-        return httpx.Response(200, json={"results": [{"id": 2}]})
+            return httpx2.Response(200, json={"results": [{"id": 1}], "next_cursor": "abc"})
+        return httpx2.Response(200, json={"results": [{"id": 2}]})
 
     cursor_result = HTTPModel(
-        config=HTTPConfig(base_url="https://api.example.test", transport=httpx.MockTransport(cursor_handler)),
+        config=HTTPConfig(base_url="https://api.example.test", transport=httpx2.MockTransport(cursor_handler)),
         path="/items",
         paginate=True,
         pagination_mode="cursor",
@@ -482,14 +482,14 @@ def test_http_model_supports_cursor_page_and_offset_pagination_with_mock_transpo
 
     page_requests = []
 
-    def page_handler(request: httpx.Request) -> httpx.Response:
+    def page_handler(request: httpx2.Request) -> httpx2.Response:
         page_requests.append(dict(request.url.params))
         page = int(request.url.params["page"])
         payload = {1: [{"id": 1}], 2: [{"id": 2}]}.get(page, [])
-        return httpx.Response(200, json={"results": payload})
+        return httpx2.Response(200, json={"results": payload})
 
     page_result = HTTPModel(
-        config=HTTPConfig(base_url="https://api.example.test", transport=httpx.MockTransport(page_handler)),
+        config=HTTPConfig(base_url="https://api.example.test", transport=httpx2.MockTransport(page_handler)),
         path="/items",
         paginate=True,
         pagination_mode="page",
@@ -500,14 +500,14 @@ def test_http_model_supports_cursor_page_and_offset_pagination_with_mock_transpo
 
     offset_requests = []
 
-    def offset_handler(request: httpx.Request) -> httpx.Response:
+    def offset_handler(request: httpx2.Request) -> httpx2.Response:
         offset_requests.append(dict(request.url.params))
         offset = int(request.url.params["offset"])
         payload = {0: [{"id": 1}], 2: [{"id": 2}]}.get(offset, [])
-        return httpx.Response(200, json={"results": payload})
+        return httpx2.Response(200, json={"results": payload})
 
     offset_result = HTTPModel(
-        config=HTTPConfig(base_url="https://api.example.test", transport=httpx.MockTransport(offset_handler)),
+        config=HTTPConfig(base_url="https://api.example.test", transport=httpx2.MockTransport(offset_handler)),
         path="/items",
         paginate=True,
         pagination_mode="offset",
@@ -546,19 +546,19 @@ def _retrying_client(calls, response_factory):
 
 
 def _raise_status(status_code, headers=None):
-    request = httpx.Request("GET", "https://api.example.test/v1/tickers")
-    response = httpx.Response(status_code, request=request, headers=headers or {})
-    raise httpx.HTTPStatusError("error", request=request, response=response)
+    request = httpx2.Request("GET", "https://api.example.test/v1/tickers")
+    response = httpx2.Response(status_code, request=request, headers=headers or {})
+    raise httpx2.HTTPStatusError("error", request=request, response=response)
 
 
-@pytest.mark.parametrize(("exception_type", "category"), [(httpx.ConnectError, "connection"), (httpx.RemoteProtocolError, "exception")])
+@pytest.mark.parametrize(("exception_type", "category"), [(httpx2.ConnectError, "connection"), (httpx2.RemoteProtocolError, "exception")])
 def test_http_model_retries_transport_error(monkeypatch, exception_type, category):
     calls = []
 
     def fail_once():
         raise exception_type("transport failed")
 
-    monkeypatch.setattr("ccflow_http.base.httpx.Client", _retrying_client(calls, fail_once))
+    monkeypatch.setattr("ccflow_http.base.httpx2.Client", _retrying_client(calls, fail_once))
 
     result = HTTPModel(base_url="https://api.example.test", path="/v1/tickers", max_attempts=2)(HTTPRequestContext())
 
@@ -569,7 +569,7 @@ def test_http_model_retries_transport_error(monkeypatch, exception_type, categor
 
 def test_http_model_honors_retry_after_seconds_over_backoff(monkeypatch):
     calls = []
-    monkeypatch.setattr("ccflow_http.base.httpx.Client", _retrying_client(calls, lambda: _raise_status(429, {"retry-after": "45"})))
+    monkeypatch.setattr("ccflow_http.base.httpx2.Client", _retrying_client(calls, lambda: _raise_status(429, {"retry-after": "45"})))
 
     model = HTTPModel(
         base_url="https://api.example.test",
@@ -588,7 +588,7 @@ def test_http_model_honors_retry_after_seconds_over_backoff(monkeypatch):
 
 def test_http_model_uses_backoff_when_it_exceeds_retry_after(monkeypatch):
     calls = []
-    monkeypatch.setattr("ccflow_http.base.httpx.Client", _retrying_client(calls, lambda: _raise_status(429, {"retry-after": "1"})))
+    monkeypatch.setattr("ccflow_http.base.httpx2.Client", _retrying_client(calls, lambda: _raise_status(429, {"retry-after": "1"})))
 
     model = HTTPModel(
         base_url="https://api.example.test",
@@ -605,7 +605,7 @@ def test_http_model_uses_backoff_when_it_exceeds_retry_after(monkeypatch):
 
 def test_http_model_caps_retry_after_at_retry_after_max(monkeypatch):
     calls = []
-    monkeypatch.setattr("ccflow_http.base.httpx.Client", _retrying_client(calls, lambda: _raise_status(429, {"retry-after": "9999"})))
+    monkeypatch.setattr("ccflow_http.base.httpx2.Client", _retrying_client(calls, lambda: _raise_status(429, {"retry-after": "9999"})))
 
     model = HTTPModel(
         base_url="https://api.example.test",
@@ -626,7 +626,7 @@ def test_http_model_honors_retry_after_http_date(monkeypatch):
 
     calls = []
     retry_at = format_datetime(datetime.now(UTC) + timedelta(seconds=60))
-    monkeypatch.setattr("ccflow_http.base.httpx.Client", _retrying_client(calls, lambda: _raise_status(429, {"retry-after": retry_at})))
+    monkeypatch.setattr("ccflow_http.base.httpx2.Client", _retrying_client(calls, lambda: _raise_status(429, {"retry-after": retry_at})))
 
     model = HTTPModel(
         base_url="https://api.example.test",
@@ -644,7 +644,7 @@ def test_http_model_honors_retry_after_http_date(monkeypatch):
 
 def test_http_model_ignores_invalid_retry_after(monkeypatch):
     calls = []
-    monkeypatch.setattr("ccflow_http.base.httpx.Client", _retrying_client(calls, lambda: _raise_status(429, {"retry-after": "soon"})))
+    monkeypatch.setattr("ccflow_http.base.httpx2.Client", _retrying_client(calls, lambda: _raise_status(429, {"retry-after": "soon"})))
 
     model = HTTPModel(
         base_url="https://api.example.test",
