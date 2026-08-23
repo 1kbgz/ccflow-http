@@ -31,7 +31,7 @@ classifiers = [
 dependencies = [
     "ccflow>=0.8.5",
     "ccflow-etl>=0.1.0",
-    "httpx",
+    "httpx2",
     "jinja2",
 ]
 

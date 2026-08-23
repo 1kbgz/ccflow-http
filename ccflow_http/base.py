@@ -8,7 +8,7 @@ from time import monotonic, sleep
 from typing import Any, Literal
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
-import httpx
+import httpx2
 from ccflow import BaseModel, CallableModel, ContextBase, Flow, GenericResult, PyObjectPath
 from ccflow.utils.retry import RetryPolicy
 from ccflow_etl import ExecutionPolicy
@@ -105,7 +105,7 @@ class HTTPRetryEvent(BaseModel):
 
 class HTTPRetryPolicy(RetryPolicy):
     retry_status_codes: list[int] = Field(default_factory=lambda: [429, 500, 502, 503, 504])
-    retry_exceptions: list[PyObjectPath] = Field(default_factory=lambda: [PyObjectPath.validate(httpx.TransportError)])
+    retry_exceptions: list[PyObjectPath] = Field(default_factory=lambda: [PyObjectPath.validate(httpx2.TransportError)])
     timeout_exception_types: list[str] = Field(
         default_factory=lambda: ["TimeoutError", "TimeoutException", "ConnectTimeout", "ReadTimeout", "WriteTimeout", "PoolTimeout"]
     )
@@ -307,7 +307,7 @@ class HTTPModel(CallableModel):
             content=context.content if context.content is not None else self.content,
         )
 
-    def _response_value(self, response: httpx.Response) -> Any:
+    def _response_value(self, response: httpx2.Response) -> Any:
         match self.response_format:
             case "json":
                 return response.json()
@@ -372,8 +372,8 @@ class HTTPModel(CallableModel):
         return current
 
     def _request_once(
-        self, client: httpx.Client, request: HTTPRequest, previous_started_at: float | None
-    ) -> tuple[httpx.Response, int, list[dict[str, Any]], float]:
+        self, client: httpx2.Client, request: HTTPRequest, previous_started_at: float | None
+    ) -> tuple[httpx2.Response, int, list[dict[str, Any]], float]:
         attempts = 0
         events: list[dict[str, Any]] = []
         retry_policy = self._retry_policy()
@@ -392,7 +392,7 @@ class HTTPModel(CallableModel):
                 )
                 response.raise_for_status()
                 return response, attempts, events, previous_started_at
-            except httpx.HTTPStatusError as exc:
+            except httpx2.HTTPStatusError as exc:
                 status_code = exc.response.status_code if exc.response is not None else None
                 if retry_policy.should_retry_status(status_code, attempts):
                     delay_seconds = retry_policy.retry_delay_seconds(attempts, total_wait_seconds=total_retry_wait_seconds)
@@ -424,7 +424,7 @@ class HTTPModel(CallableModel):
                 )
                 status_label = status_code if status_code is not None else "unknown"
                 raise RuntimeError(f"HTTP {request.method} {self._safe_url(request)} failed with status {status_label}") from exc
-            except httpx.TransportError as exc:
+            except httpx2.TransportError as exc:
                 if retry_policy.should_retry_exception(exc, attempts):
                     delay_seconds = retry_policy.retry_delay_seconds(attempts, total_wait_seconds=total_retry_wait_seconds)
                     if delay_seconds is not None:
@@ -451,7 +451,7 @@ class HTTPModel(CallableModel):
                     )
                 )
                 raise RuntimeError(f"HTTP {request.method} {self._safe_url(request)} failed with {type(exc).__name__}") from exc
-            except httpx.HTTPError as exc:
+            except httpx2.HTTPError as exc:
                 raise RuntimeError(f"HTTP {request.method} {self._safe_url(request)} failed with {type(exc).__name__}") from exc
 
     def _merge_page_values(self, values: list[Any]) -> Any:
@@ -532,7 +532,7 @@ class HTTPModel(CallableModel):
     def __call__(self, context: HTTPRequestContext) -> HTTPResult:
         request = self._initial_paginated_request(self.build_request(context))
 
-        with httpx.Client(**self._client_kwargs()) as client:
+        with httpx2.Client(**self._client_kwargs()) as client:
             values = []
             retry_events = []
             total_attempts = 0
