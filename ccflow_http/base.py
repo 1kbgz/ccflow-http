@@ -4,9 +4,10 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from gzip import decompress
 from io import StringIO
+from logging import Filter, LogRecord, getLogger
 from time import monotonic, sleep
 from typing import Any, Literal
-from urllib.parse import parse_qsl, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote_plus, urlsplit, urlunsplit
 
 import httpx2
 from ccflow import BaseModel, CallableModel, ContextBase, Flow, GenericResult, PyObjectPath
@@ -26,6 +27,7 @@ __all__ = (
     "HTTPResult",
     "HTTPRetryPolicy",
     "redact_mapping",
+    "redact_url",
     "safe_request_dump",
 )
 
@@ -75,15 +77,36 @@ class HTTPRequest(BaseModel):
     content: bytes | str | None = None
 
 
+def _is_sensitive_key(key: str) -> bool:
+    normalized_key = key.lower().replace("_", "").replace("-", "")
+    return normalized_key in {"apikey", "authorization", "password"} or "token" in normalized_key or "secret" in normalized_key
+
+
 def redact_mapping(values: dict[str, Any]) -> dict[str, Any]:
-    redacted = {}
-    for key, value in values.items():
-        normalized_key = key.lower().replace("_", "").replace("-", "")
-        if normalized_key in {"apikey", "authorization", "password"} or "token" in normalized_key or "secret" in normalized_key:
-            redacted[key] = "***"
-        else:
-            redacted[key] = value
-    return redacted
+    return {key: "***" if _is_sensitive_key(key) else value for key, value in values.items()}
+
+
+def redact_url(url: str) -> str:
+    parts = urlsplit(url)
+    if not parts.query:
+        return url
+    pairs = []
+    for pair in parts.query.split("&"):
+        key = pair.split("=", 1)[0]
+        pairs.append(f"{key}=***" if _is_sensitive_key(unquote_plus(key)) else pair)
+    return urlunsplit(parts._replace(query="&".join(pairs)))
+
+
+class _RedactURLFilter(Filter):
+    """Redact secret query values from URLs that httpx2 logs for each request."""
+
+    def filter(self, record: LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(redact_url(str(arg)) if isinstance(arg, httpx2.URL) else arg for arg in record.args)
+        return True
+
+
+getLogger("httpx2").addFilter(_RedactURLFilter())
 
 
 def safe_request_dump(request: HTTPRequest) -> dict[str, Any]:
@@ -423,7 +446,8 @@ class HTTPModel(CallableModel):
                     )
                 )
                 status_label = status_code if status_code is not None else "unknown"
-                raise RuntimeError(f"HTTP {request.method} {self._safe_url(request)} failed with status {status_label}") from exc
+                # httpx2 status errors embed the full request URL, including secret query values.
+                raise RuntimeError(f"HTTP {request.method} {self._safe_url(request)} failed with status {status_label}") from None
             except httpx2.TransportError as exc:
                 if retry_policy.should_retry_exception(exc, attempts):
                     delay_seconds = retry_policy.retry_delay_seconds(attempts, total_wait_seconds=total_retry_wait_seconds)
@@ -472,15 +496,11 @@ class HTTPModel(CallableModel):
     def _request_with_params(self, request: HTTPRequest, params: dict[str, Any]) -> HTTPRequest:
         return request.model_copy(update={"params": {**request.params, **params}})
 
-    def _is_sensitive_query_param(self, key: str) -> bool:
-        normalized_key = key.lower().replace("_", "").replace("-", "")
-        return normalized_key in {"apikey", "authorization", "password"} or "token" in normalized_key or "secret" in normalized_key
-
     def _next_url_request(self, request: HTTPRequest, next_url: str) -> HTTPRequest:
         next_url_parts = urlsplit(next_url)
         next_url_params = dict(parse_qsl(next_url_parts.query, keep_blank_values=True))
         for key, value in request.params.items():
-            if key not in next_url_params and self._is_sensitive_query_param(key):
+            if key not in next_url_params and _is_sensitive_key(key):
                 next_url_params[key] = value
         next_url_without_query = urlunsplit((next_url_parts.scheme, next_url_parts.netloc, next_url_parts.path, "", next_url_parts.fragment))
         return request.model_copy(update={"url": next_url_without_query, "params": next_url_params})
@@ -557,7 +577,7 @@ class HTTPModel(CallableModel):
                 value=self._merge_page_values(values) if self.paginate else values[-1],
                 status_code=response.status_code,
                 headers=dict(response.headers or {}),
-                url=str(response.url),
+                url=redact_url(str(response.url)),
                 attempts=total_attempts,
                 pages=pages,
                 rate_limit=self._rate_limit_headers(dict(response.headers or {})),

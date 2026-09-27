@@ -10,7 +10,17 @@ import httpx2
 import pytest
 from ccflow_etl import ExecutionPolicy
 
-from ccflow_http import HTTPAuth, HTTPConfig, HTTPModel, HTTPRequest, HTTPRequestContext, HTTPResponseResult, HTTPRetryPolicy, safe_request_dump
+from ccflow_http import (
+    HTTPAuth,
+    HTTPConfig,
+    HTTPModel,
+    HTTPRequest,
+    HTTPRequestContext,
+    HTTPResponseResult,
+    HTTPRetryPolicy,
+    redact_url,
+    safe_request_dump,
+)
 
 
 @dataclass
@@ -146,6 +156,34 @@ def test_http_model_error_message_omits_secret_query_values(monkeypatch):
 
     assert "secret" not in str(error.value)
     assert "apiKey" not in str(error.value)
+    assert error.value.__cause__ is None
+    assert error.value.__suppress_context__
+
+
+def test_redact_url_masks_secret_query_values():
+    assert (
+        redact_url("https://api.example.test/v1/tickers?date=2024-01-03&apiKey=abc&page_token=def&limit=10")
+        == "https://api.example.test/v1/tickers?date=2024-01-03&apiKey=***&page_token=***&limit=10"
+    )
+    assert redact_url("https://api.example.test/v1/tickers") == "https://api.example.test/v1/tickers"
+    assert redact_url("/v1/tickers?cursor=2") == "/v1/tickers?cursor=2"
+
+
+def test_http_model_redacts_secret_query_values_from_request_log_and_result(caplog):
+    transport = httpx2.MockTransport(lambda request: httpx2.Response(200, json={"status": "OK"}))
+    model = HTTPModel(
+        config=HTTPConfig(base_url="https://api.example.test", transport=transport),
+        path="/v1/tickers",
+        query={"date": "2024-01-03"},
+        auth=HTTPAuth(strategy="api_key_query", name="apiKey", value="query-key"),
+    )
+
+    with caplog.at_level("INFO", logger="httpx2"):
+        result = model(HTTPRequestContext())
+
+    assert "HTTP Request: GET https://api.example.test/v1/tickers?date=2024-01-03&apiKey=***" in caplog.text
+    assert "query-key" not in caplog.text
+    assert result.url == "https://api.example.test/v1/tickers?date=2024-01-03&apiKey=***"
 
 
 def test_http_model_retries_retryable_status_and_captures_rate_limit(monkeypatch):
