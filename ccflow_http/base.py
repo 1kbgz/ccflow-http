@@ -220,6 +220,10 @@ class HTTPModel(CallableModel):
     max_attempts: int = 1
     retry_status_codes: list[int] = Field(default_factory=lambda: [429, 500, 502, 503, 504])
     retry_policy: HTTPRetryPolicy | None = None
+    accepted_status_codes: list[int] = Field(
+        default_factory=list,
+        description="Error status codes returned as results with value None instead of raising, such as 404 for lookups that may miss.",
+    )
     execution_policy: ExecutionPolicy | None = None
     paginate: bool = False
     max_pages: int = 100
@@ -413,6 +417,8 @@ class HTTPModel(CallableModel):
                     json=request.json_data,
                     content=request.content,
                 )
+                if response.status_code in self.accepted_status_codes:
+                    return response, attempts, events, previous_started_at
                 response.raise_for_status()
                 return response, attempts, events, previous_started_at
             except httpx2.HTTPStatusError as exc:
@@ -563,6 +569,9 @@ class HTTPModel(CallableModel):
                 total_attempts += attempts
                 retry_events.extend(events)
                 pages += 1
+                accepted_error = response.status_code in self.accepted_status_codes
+                if accepted_error:
+                    break
                 value = self._response_value(response)
                 values.append(value)
 
@@ -574,7 +583,7 @@ class HTTPModel(CallableModel):
                 request = next_request
 
             return HTTPResult(
-                value=self._merge_page_values(values) if self.paginate else values[-1],
+                value=None if accepted_error else (self._merge_page_values(values) if self.paginate else values[-1]),
                 status_code=response.status_code,
                 headers=dict(response.headers or {}),
                 url=redact_url(str(response.url)),

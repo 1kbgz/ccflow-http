@@ -477,6 +477,39 @@ def test_http_model_applies_config_and_all_auth_strategies_with_mock_transport()
     assert "authorization" not in seen_requests[4].headers
 
 
+def test_http_model_returns_accepted_error_status_without_raising():
+    transport = httpx2.MockTransport(lambda request: httpx2.Response(404, json={"status": "NOT_FOUND"}))
+    config = HTTPConfig(base_url="https://api.example.test", transport=transport)
+
+    result = HTTPModel(config=config, path="/v1/tickers/ZZZZ", accepted_status_codes=[404])(HTTPRequestContext())
+
+    assert result.status_code == 404
+    assert result.value is None
+    assert result.retry_summary == {"attempts": 1, "retried": 0, "failed": 0, "succeeded": 1}
+    with pytest.raises(RuntimeError, match="failed with status 404"):
+        HTTPModel(config=config, path="/v1/tickers/ZZZZ")(HTTPRequestContext())
+
+
+def test_http_model_stops_pagination_on_accepted_error_status():
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        if "cursor" in request.url.params:
+            return httpx2.Response(404)
+        return httpx2.Response(200, json={"results": [{"ticker": "AAA"}], "next_url": "/v1/tickers?cursor=2"})
+
+    model = HTTPModel(
+        config=HTTPConfig(base_url="https://api.example.test", transport=httpx2.MockTransport(handler)),
+        path="/v1/tickers",
+        paginate=True,
+        accepted_status_codes=[404],
+    )
+
+    result = model(HTTPRequestContext())
+
+    assert result.status_code == 404
+    assert result.value is None
+    assert result.pages == 2
+
+
 def test_http_model_parses_csv_and_gzip_responses_with_mock_transport():
     def csv_handler(request: httpx2.Request) -> httpx2.Response:
         return httpx2.Response(200, text="ticker,volume\nAAA,10\nBBB,20\n")
