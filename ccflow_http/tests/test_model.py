@@ -490,7 +490,7 @@ def test_http_model_returns_accepted_error_status_without_raising():
         HTTPModel(config=config, path="/v1/tickers/ZZZZ")(HTTPRequestContext())
 
 
-def test_http_model_stops_pagination_on_accepted_error_status():
+def test_http_model_raises_on_accepted_error_status_after_first_page():
     def handler(request: httpx2.Request) -> httpx2.Response:
         if "cursor" in request.url.params:
             return httpx2.Response(404)
@@ -503,11 +503,80 @@ def test_http_model_stops_pagination_on_accepted_error_status():
         accepted_status_codes=[404],
     )
 
+    with pytest.raises(RuntimeError, match="status 404 on page 2"):
+        model(HTTPRequestContext())
+
+
+def test_http_model_redacts_custom_query_auth_name_everywhere(caplog):
+    seen_urls = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen_urls.append(str(request.url))
+        if len(seen_urls) == 1:
+            return httpx2.Response(200, json={"results": [{"ticker": "AAA"}], "next_url": "/v1/tickers?cursor=2"})
+        return httpx2.Response(200, json={"results": [{"ticker": "BBB"}]})
+
+    model = HTTPModel(
+        config=HTTPConfig(base_url="https://api.example.test", transport=httpx2.MockTransport(handler)),
+        path="/v1/tickers",
+        paginate=True,
+        auth=HTTPAuth(strategy="api_key_query", name="key", value="custom-secret"),
+    )
+
+    with caplog.at_level("INFO", logger="httpx2"):
+        result = model(HTTPRequestContext())
+
+    assert seen_urls == ["https://api.example.test/v1/tickers?key=custom-secret", "https://api.example.test/v1/tickers?cursor=2&key=custom-secret"]
+    assert "custom-secret" not in caplog.text
+    assert caplog.text.count("key=***") == 2
+    assert result.url == "https://api.example.test/v1/tickers?cursor=2&key=***"
+    assert safe_request_dump(model.build_request(HTTPRequestContext()))["params"] == {"key": "***"}
+
+
+def test_http_model_does_not_leak_query_secrets_through_transport_errors(monkeypatch):
+    monkeypatch.setattr("ccflow_http.base.sleep", lambda seconds: None)
+    calls = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        calls.append(request)
+        if len(calls) == 1:
+            raise httpx2.ConnectError(f"connection reset for {request.url}", request=request)
+        raise httpx2.ReadTimeout(f"read timed out for {request.url}", request=request)
+
+    model = HTTPModel(
+        config=HTTPConfig(base_url="https://api.example.test", transport=httpx2.MockTransport(handler)),
+        path="/v1/tickers",
+        auth=HTTPAuth(strategy="api_key_query", name="key", value="custom-secret"),
+        retry_policy=HTTPRetryPolicy(max_attempts=2, wait_initial=0.0, wait_max=0.0, wait_jitter=0.0),
+    )
+
+    with pytest.raises(RuntimeError, match="failed with ReadTimeout") as error:
+        model(HTTPRequestContext())
+
+    assert error.value.__cause__ is None
+    assert error.value.__suppress_context__
+
+
+def test_http_model_redacts_query_secrets_in_retry_event_messages(monkeypatch):
+    monkeypatch.setattr("ccflow_http.base.sleep", lambda seconds: None)
+    calls = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        calls.append(request)
+        if len(calls) == 1:
+            raise httpx2.ConnectError(f"connection reset for {request.url}", request=request)
+        return httpx2.Response(200, json={"status": "OK"})
+
+    model = HTTPModel(
+        config=HTTPConfig(base_url="https://api.example.test", transport=httpx2.MockTransport(handler)),
+        path="/v1/tickers",
+        auth=HTTPAuth(strategy="api_key_query", name="key", value="custom-secret"),
+        retry_policy=HTTPRetryPolicy(max_attempts=2, wait_initial=0.0, wait_max=0.0, wait_jitter=0.0),
+    )
+
     result = model(HTTPRequestContext())
 
-    assert result.status_code == 404
-    assert result.value is None
-    assert result.pages == 2
+    assert result.retry_events[0]["message"] == "connection reset for https://api.example.test/v1/tickers?key=***"
 
 
 def test_http_model_parses_csv_and_gzip_responses_with_mock_transport():

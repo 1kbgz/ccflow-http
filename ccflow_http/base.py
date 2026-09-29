@@ -1,4 +1,7 @@
+import re
 from base64 import b64encode
+from collections.abc import Collection
+from contextvars import ContextVar
 from csv import DictReader
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -14,7 +17,7 @@ from ccflow import BaseModel, CallableModel, ContextBase, Flow, GenericResult, P
 from ccflow.utils.retry import RetryPolicy
 from ccflow_etl import ExecutionPolicy
 from jinja2 import Environment
-from pydantic import Field
+from pydantic import Field, PrivateAttr
 
 __all__ = (
     "HTTPAuth",
@@ -75,26 +78,38 @@ class HTTPRequest(BaseModel):
     headers: dict[str, str] = Field(default_factory=dict)
     json_data: Any | None = None
     content: bytes | str | None = None
+    # Query parameter names that carry credentials under names the key heuristic may not recognize, such as api_key_query auth.
+    _sensitive_params: frozenset[str] = PrivateAttr(default_factory=frozenset)
 
 
-def _is_sensitive_key(key: str) -> bool:
+# Extra sensitive query names for the request in flight, so the httpx2 log filter can redact them.
+_REQUEST_SENSITIVE_PARAMS: ContextVar[frozenset[str]] = ContextVar("ccflow_http_request_sensitive_params", default=frozenset())
+_QUERY_PAIR = re.compile(r"([?&])([^=&\s'\"]+)=([^&\s'\"]*)")
+
+
+def _is_sensitive_key(key: str, extra: Collection[str] = ()) -> bool:
     normalized_key = key.lower().replace("_", "").replace("-", "")
-    return normalized_key in {"apikey", "authorization", "password"} or "token" in normalized_key or "secret" in normalized_key
+    return key in extra or normalized_key in {"apikey", "authorization", "password"} or "token" in normalized_key or "secret" in normalized_key
 
 
-def redact_mapping(values: dict[str, Any]) -> dict[str, Any]:
-    return {key: "***" if _is_sensitive_key(key) else value for key, value in values.items()}
+def redact_mapping(values: dict[str, Any], extra: Collection[str] = ()) -> dict[str, Any]:
+    return {key: "***" if _is_sensitive_key(key, extra) else value for key, value in values.items()}
 
 
-def redact_url(url: str) -> str:
+def redact_url(url: str, extra: Collection[str] = ()) -> str:
     parts = urlsplit(url)
     if not parts.query:
         return url
     pairs = []
     for pair in parts.query.split("&"):
         key = pair.split("=", 1)[0]
-        pairs.append(f"{key}=***" if _is_sensitive_key(unquote_plus(key)) else pair)
+        pairs.append(f"{key}=***" if _is_sensitive_key(unquote_plus(key), extra) else pair)
     return urlunsplit(parts._replace(query="&".join(pairs)))
+
+
+def _redact_query_text(text: str, extra: Collection[str] = ()) -> str:
+    """Redact secret query values that appear anywhere in free text, such as an exception message quoting a URL."""
+    return _QUERY_PAIR.sub(lambda match: f"{match[1]}{match[2]}=***" if _is_sensitive_key(unquote_plus(match[2]), extra) else match[0], text)
 
 
 class _RedactURLFilter(Filter):
@@ -102,7 +117,8 @@ class _RedactURLFilter(Filter):
 
     def filter(self, record: LogRecord) -> bool:
         if isinstance(record.args, tuple):
-            record.args = tuple(redact_url(str(arg)) if isinstance(arg, httpx2.URL) else arg for arg in record.args)
+            extra = _REQUEST_SENSITIVE_PARAMS.get()
+            record.args = tuple(redact_url(str(arg), extra) if isinstance(arg, httpx2.URL) else arg for arg in record.args)
         return True
 
 
@@ -111,7 +127,7 @@ getLogger("httpx2").addFilter(_RedactURLFilter())
 
 def safe_request_dump(request: HTTPRequest) -> dict[str, Any]:
     request_data = request.model_dump(exclude={"type_"})
-    request_data["params"] = redact_mapping(request_data.get("params", {}))
+    request_data["params"] = redact_mapping(request_data.get("params", {}), request._sensitive_params)
     request_data["headers"] = redact_mapping(request_data.get("headers", {}))
     return request_data
 
@@ -325,7 +341,7 @@ class HTTPModel(CallableModel):
         rendered_headers = self._render_mapping(headers, data)
         self._apply_auth(rendered_headers, rendered_query, data)
 
-        return HTTPRequest(
+        request = HTTPRequest(
             method=self.method,
             url=self._render(path, data),
             params=rendered_query,
@@ -333,6 +349,9 @@ class HTTPModel(CallableModel):
             json_data=context.json_body if context.json_body is not None else self.json_body,
             content=context.content if context.content is not None else self.content,
         )
+        if self.auth.strategy == "api_key_query":
+            request._sensitive_params = frozenset({self._render_required_auth_value(self.auth.name, "name", data)})
+        return request
 
     def _response_value(self, response: httpx2.Response) -> Any:
         match self.response_format:
@@ -465,7 +484,7 @@ class HTTPModel(CallableModel):
                                 delay_seconds=delay_seconds,
                                 exception_type=type(exc).__name__,
                                 category=retry_policy.exception_category(exc),
-                                message=str(exc),
+                                message=_redact_query_text(str(exc), request._sensitive_params),
                             )
                         )
                         self._sleep(delay_seconds)
@@ -477,12 +496,13 @@ class HTTPModel(CallableModel):
                         outcome="failed",
                         exception_type=type(exc).__name__,
                         category=retry_policy.exception_category(exc),
-                        message=str(exc),
+                        message=_redact_query_text(str(exc), request._sensitive_params),
                     )
                 )
-                raise RuntimeError(f"HTTP {request.method} {self._safe_url(request)} failed with {type(exc).__name__}") from exc
+                # httpx2 exceptions keep the full request, including secret query values, so do not chain them.
+                raise RuntimeError(f"HTTP {request.method} {self._safe_url(request)} failed with {type(exc).__name__}") from None
             except httpx2.HTTPError as exc:
-                raise RuntimeError(f"HTTP {request.method} {self._safe_url(request)} failed with {type(exc).__name__}") from exc
+                raise RuntimeError(f"HTTP {request.method} {self._safe_url(request)} failed with {type(exc).__name__}") from None
 
     def _merge_page_values(self, values: list[Any]) -> Any:
         if not values:
@@ -506,7 +526,7 @@ class HTTPModel(CallableModel):
         next_url_parts = urlsplit(next_url)
         next_url_params = dict(parse_qsl(next_url_parts.query, keep_blank_values=True))
         for key, value in request.params.items():
-            if key not in next_url_params and _is_sensitive_key(key):
+            if key not in next_url_params and _is_sensitive_key(key, request._sensitive_params):
                 next_url_params[key] = value
         next_url_without_query = urlunsplit((next_url_parts.scheme, next_url_parts.netloc, next_url_parts.path, "", next_url_parts.fragment))
         return request.model_copy(update={"url": next_url_without_query, "params": next_url_params})
@@ -557,39 +577,49 @@ class HTTPModel(CallableModel):
     @Flow.call
     def __call__(self, context: HTTPRequestContext) -> HTTPResult:
         request = self._initial_paginated_request(self.build_request(context))
+        sensitive_params = request._sensitive_params
 
-        with httpx2.Client(**self._client_kwargs()) as client:
-            values = []
-            retry_events = []
-            total_attempts = 0
-            pages = 0
-            previous_started_at = None
-            while True:
-                response, attempts, events, previous_started_at = self._request_once(client, request, previous_started_at)
-                total_attempts += attempts
-                retry_events.extend(events)
-                pages += 1
-                accepted_error = response.status_code in self.accepted_status_codes
-                if accepted_error:
-                    break
-                value = self._response_value(response)
-                values.append(value)
+        token = _REQUEST_SENSITIVE_PARAMS.set(sensitive_params)
+        try:
+            with httpx2.Client(**self._client_kwargs()) as client:
+                values = []
+                retry_events = []
+                total_attempts = 0
+                pages = 0
+                previous_started_at = None
+                while True:
+                    response, attempts, events, previous_started_at = self._request_once(client, request, previous_started_at)
+                    total_attempts += attempts
+                    retry_events.extend(events)
+                    pages += 1
+                    accepted_error = response.status_code in self.accepted_status_codes
+                    if accepted_error:
+                        if pages > 1:
+                            raise RuntimeError(
+                                f"HTTP {request.method} {self._safe_url(request)} returned status {response.status_code} on page {pages}; "
+                                "accepted statuses are only returned for the first page"
+                            )
+                        break
+                    value = self._response_value(response)
+                    values.append(value)
 
-                if not self.paginate or pages >= self.max_pages:
-                    break
-                next_request = self._next_paginated_request(request, value)
-                if next_request is None:
-                    break
-                request = next_request
+                    if not self.paginate or pages >= self.max_pages:
+                        break
+                    next_request = self._next_paginated_request(request, value)
+                    if next_request is None:
+                        break
+                    request = next_request
+        finally:
+            _REQUEST_SENSITIVE_PARAMS.reset(token)
 
-            return HTTPResult(
-                value=None if accepted_error else (self._merge_page_values(values) if self.paginate else values[-1]),
-                status_code=response.status_code,
-                headers=dict(response.headers or {}),
-                url=redact_url(str(response.url)),
-                attempts=total_attempts,
-                pages=pages,
-                rate_limit=self._rate_limit_headers(dict(response.headers or {})),
-                retry_events=retry_events,
-                retry_summary=self._retry_summary(retry_events, attempts=total_attempts, succeeded=True),
-            )
+        return HTTPResult(
+            value=None if accepted_error else (self._merge_page_values(values) if self.paginate else values[-1]),
+            status_code=response.status_code,
+            headers=dict(response.headers or {}),
+            url=redact_url(str(response.url), sensitive_params),
+            attempts=total_attempts,
+            pages=pages,
+            rate_limit=self._rate_limit_headers(dict(response.headers or {})),
+            retry_events=retry_events,
+            retry_summary=self._retry_summary(retry_events, attempts=total_attempts, succeeded=True),
+        )
