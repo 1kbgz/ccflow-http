@@ -417,6 +417,16 @@ class HTTPModel(CallableModel):
             current = current.get(part)
         return current
 
+    def _send(self, client: httpx2.Client, request: HTTPRequest) -> httpx2.Response:
+        return client.request(
+            method=request.method,
+            url=request.url,
+            params=request.params,
+            headers=request.headers,
+            json=request.json_data,
+            content=request.content,
+        )
+
     def _request_once(
         self, client: httpx2.Client, request: HTTPRequest, previous_started_at: float | None
     ) -> tuple[httpx2.Response, int, list[dict[str, Any]], float]:
@@ -428,19 +438,14 @@ class HTTPModel(CallableModel):
             attempts += 1
             previous_started_at = self._throttle(previous_started_at)
             try:
-                response = client.request(
-                    method=request.method,
-                    url=request.url,
-                    params=request.params,
-                    headers=request.headers,
-                    json=request.json_data,
-                    content=request.content,
-                )
+                response = self._send(client, request)
                 if response.status_code in self.accepted_status_codes:
                     return response, attempts, events, previous_started_at
                 response.raise_for_status()
                 return response, attempts, events, previous_started_at
             except httpx2.HTTPStatusError as exc:
+                if exc.response is not None:
+                    exc.response.close()
                 status_code = exc.response.status_code if exc.response is not None else None
                 if retry_policy.should_retry_status(status_code, attempts):
                     delay_seconds = retry_policy.retry_delay_seconds(attempts, total_wait_seconds=total_retry_wait_seconds)
