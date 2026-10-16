@@ -6,7 +6,7 @@ from typing import Any
 from uuid import uuid4
 
 import httpx2
-from ccflow import CallableModel, ContextType, DateContext, Flow, ResultBase, ResultType
+from ccflow import CallableModel, DateContext, Flow, ResultBase
 from ccflow_etl import ArtifactWriteFileContext, ArtifactWriteFileModel, ArtifactWriteFileResult
 from pydantic import Field
 
@@ -48,11 +48,11 @@ class HTTPDownloadModel(HTTPModel):
     chunk_size: int = Field(default=1 << 20, ge=1)
 
     @property
-    def context_type(self) -> type[ContextType]:
+    def context_type(self) -> type[HTTPDownloadContext]:
         return HTTPDownloadContext
 
     @property
-    def result_type(self) -> type[ResultType]:
+    def result_type(self) -> type[HTTPDownloadResult]:
         return HTTPDownloadResult
 
     def _send(self, client: httpx2.Client, request: HTTPRequest) -> httpx2.Response:
@@ -135,11 +135,11 @@ class HTTPArtifactCaptureModel(CallableModel):
     explain: bool = False
 
     @property
-    def context_type(self) -> type[ContextType]:
+    def context_type(self) -> type[DateContext]:
         return DateContext
 
     @property
-    def result_type(self) -> type[ResultType]:
+    def result_type(self) -> type[HTTPArtifactCaptureResult]:
         return HTTPArtifactCaptureResult
 
     def key(self, context: DateContext) -> str:
