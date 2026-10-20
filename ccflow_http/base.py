@@ -17,7 +17,7 @@ from ccflow import BaseModel, CallableModel, ContextBase, Flow, GenericResult, P
 from ccflow.utils.retry import RetryPolicy
 from ccflow_etl import ExecutionPolicy
 from jinja2 import Environment
-from pydantic import Field, PrivateAttr
+from pydantic import Field, PrivateAttr, field_validator
 
 __all__ = (
     "HTTPAuth",
@@ -29,6 +29,7 @@ __all__ = (
     "HTTPResponseResult",
     "HTTPResult",
     "HTTPRetryPolicy",
+    "RedactionPolicy",
     "redact_mapping",
     "redact_url",
     "safe_request_dump",
@@ -78,38 +79,79 @@ class HTTPRequest(BaseModel):
     headers: dict[str, str] = Field(default_factory=dict)
     json_data: Any | None = None
     content: bytes | str | None = None
-    # Query parameter names that carry credentials under names the key heuristic may not recognize, such as api_key_query auth.
-    _sensitive_params: frozenset[str] = PrivateAttr(default_factory=frozenset)
+    # Redaction for this request: the model's policy plus any names its auth places credentials under.
+    _redaction: "RedactionPolicy" = PrivateAttr(default_factory=lambda: _DEFAULT_REDACTION)
 
 
-# Extra sensitive query names for the request in flight, so the httpx2 log filter can redact them.
-_REQUEST_SENSITIVE_PARAMS: ContextVar[frozenset[str]] = ContextVar("ccflow_http_request_sensitive_params", default=frozenset())
 _QUERY_PAIR = re.compile(r"([?&])([^=&\s'\"]+)=([^&\s'\"]*)")
 
 
-def _is_sensitive_key(key: str, extra: Collection[str] = ()) -> bool:
-    normalized_key = key.lower().replace("_", "").replace("-", "")
-    return key in extra or normalized_key in {"apikey", "authorization", "password"} or "token" in normalized_key or "secret" in normalized_key
+def _normalize_name(name: str) -> str:
+    return name.lower().replace("_", "").replace("-", "")
 
 
-def redact_mapping(values: dict[str, Any], extra: Collection[str] = ()) -> dict[str, Any]:
-    return {key: "***" if _is_sensitive_key(key, extra) else value for key, value in values.items()}
+class RedactionPolicy(BaseModel):
+    """Which header and query parameter names carry secrets, and how their values are masked.
+
+    Names are compared after lowercasing and removing hyphens and underscores, so ``X-Api-Key`` and ``x_api_key``
+    are the same name. A name is sensitive when it is one of ``names``, contains one of ``substrings``, or matches one
+    of ``patterns`` (regular expressions searched in the normalized name). Set it on ``HTTPModel.redaction`` to cover
+    a provider's own header or parameter names; names used by ``auth`` are added automatically.
+    """
+
+    names: set[str] = Field(default_factory=lambda: {"authorization", "proxyauthorization", "cookie", "setcookie", "password"})
+    substrings: set[str] = Field(default_factory=lambda: {"apikey", "token", "secret", "password"})
+    patterns: list[str] = Field(default_factory=list)
+    mask: str = "***"
+
+    @field_validator("names", "substrings", mode="after")
+    @classmethod
+    def _normalize(cls, values: set[str]) -> set[str]:
+        return {_normalize_name(value) for value in values}
+
+    def with_names(self, *names: str) -> "RedactionPolicy":
+        """Return a copy that also treats ``names`` as sensitive."""
+        if not names:
+            return self
+        return self.model_copy(update={"names": self.names | {_normalize_name(name) for name in names}})
+
+    def is_sensitive(self, name: str) -> bool:
+        normalized = _normalize_name(name)
+        return (
+            normalized in self.names
+            or any(substring in normalized for substring in self.substrings)
+            or any(re.search(pattern, normalized) for pattern in self.patterns)
+        )
+
+    def redact_mapping(self, values: dict[str, Any]) -> dict[str, Any]:
+        return {key: self.mask if self.is_sensitive(key) else value for key, value in values.items()}
+
+    def redact_url(self, url: str) -> str:
+        parts = urlsplit(url)
+        if not parts.query:
+            return url
+        pairs = []
+        for pair in parts.query.split("&"):
+            key = pair.split("=", 1)[0]
+            pairs.append(f"{key}={self.mask}" if self.is_sensitive(unquote_plus(key)) else pair)
+        return urlunsplit(parts._replace(query="&".join(pairs)))
+
+    def redact_text(self, text: str) -> str:
+        """Redact secret query values that appear anywhere in free text, such as an exception message quoting a URL."""
+        return _QUERY_PAIR.sub(lambda match: f"{match[1]}{match[2]}={self.mask}" if self.is_sensitive(unquote_plus(match[2])) else match[0], text)
 
 
-def redact_url(url: str, extra: Collection[str] = ()) -> str:
-    parts = urlsplit(url)
-    if not parts.query:
-        return url
-    pairs = []
-    for pair in parts.query.split("&"):
-        key = pair.split("=", 1)[0]
-        pairs.append(f"{key}=***" if _is_sensitive_key(unquote_plus(key), extra) else pair)
-    return urlunsplit(parts._replace(query="&".join(pairs)))
+_DEFAULT_REDACTION = RedactionPolicy()
+# Redaction policy of the request in flight, so the httpx2 log filter can apply it.
+_REQUEST_REDACTION: ContextVar[RedactionPolicy | None] = ContextVar("ccflow_http_request_redaction", default=None)
 
 
-def _redact_query_text(text: str, extra: Collection[str] = ()) -> str:
-    """Redact secret query values that appear anywhere in free text, such as an exception message quoting a URL."""
-    return _QUERY_PAIR.sub(lambda match: f"{match[1]}{match[2]}=***" if _is_sensitive_key(unquote_plus(match[2]), extra) else match[0], text)
+def redact_mapping(values: dict[str, Any], extra: Collection[str] = (), policy: RedactionPolicy | None = None) -> dict[str, Any]:
+    return (policy or _DEFAULT_REDACTION).with_names(*extra).redact_mapping(values)
+
+
+def redact_url(url: str, extra: Collection[str] = (), policy: RedactionPolicy | None = None) -> str:
+    return (policy or _DEFAULT_REDACTION).with_names(*extra).redact_url(url)
 
 
 class _RedactURLFilter(Filter):
@@ -117,8 +159,8 @@ class _RedactURLFilter(Filter):
 
     def filter(self, record: LogRecord) -> bool:
         if isinstance(record.args, tuple):
-            extra = _REQUEST_SENSITIVE_PARAMS.get()
-            record.args = tuple(redact_url(str(arg), extra) if isinstance(arg, httpx2.URL) else arg for arg in record.args)
+            policy = _REQUEST_REDACTION.get() or _DEFAULT_REDACTION
+            record.args = tuple(policy.redact_url(str(arg)) if isinstance(arg, httpx2.URL) else arg for arg in record.args)
         return True
 
 
@@ -127,8 +169,8 @@ getLogger("httpx2").addFilter(_RedactURLFilter())
 
 def safe_request_dump(request: HTTPRequest) -> dict[str, Any]:
     request_data = request.model_dump(exclude={"type_"})
-    request_data["params"] = redact_mapping(request_data.get("params", {}), request._sensitive_params)
-    request_data["headers"] = redact_mapping(request_data.get("headers", {}))
+    request_data["params"] = request._redaction.redact_mapping(request_data.get("params", {}))
+    request_data["headers"] = request._redaction.redact_mapping(request_data.get("headers", {}))
     return request_data
 
 
@@ -241,6 +283,9 @@ class HTTPModel(CallableModel):
         description="Error status codes returned as results with value None instead of raising, such as 404 for lookups that may miss.",
     )
     execution_policy: ExecutionPolicy | None = None
+    redaction: RedactionPolicy = Field(
+        default_factory=RedactionPolicy, description="Header and query parameter names whose values are masked in logs, results, and errors."
+    )
     paginate: bool = False
     max_pages: int = 100
     pagination_mode: HTTPPaginationMode = "next_url"
@@ -349,8 +394,10 @@ class HTTPModel(CallableModel):
             json_data=context.json_body if context.json_body is not None else self.json_body,
             content=context.content if context.content is not None else self.content,
         )
-        if self.auth.strategy == "api_key_query":
-            request._sensitive_params = frozenset({self._render_required_auth_value(self.auth.name, "name", data)})
+        auth_names = []
+        if self.auth.strategy in ("api_key_query", "api_key_header"):
+            auth_names.append(self._render_required_auth_value(self.auth.name, "name", data))
+        request._redaction = self.redaction.with_names(*auth_names)
         return request
 
     def _response_value(self, response: httpx2.Response) -> Any:
@@ -489,7 +536,7 @@ class HTTPModel(CallableModel):
                                 delay_seconds=delay_seconds,
                                 exception_type=type(exc).__name__,
                                 category=retry_policy.exception_category(exc),
-                                message=_redact_query_text(str(exc), request._sensitive_params),
+                                message=request._redaction.redact_text(str(exc)),
                             )
                         )
                         self._sleep(delay_seconds)
@@ -501,7 +548,7 @@ class HTTPModel(CallableModel):
                         outcome="failed",
                         exception_type=type(exc).__name__,
                         category=retry_policy.exception_category(exc),
-                        message=_redact_query_text(str(exc), request._sensitive_params),
+                        message=request._redaction.redact_text(str(exc)),
                     )
                 )
                 # httpx2 exceptions keep the full request, including secret query values, so do not chain them.
@@ -531,7 +578,7 @@ class HTTPModel(CallableModel):
         next_url_parts = urlsplit(next_url)
         next_url_params = dict(parse_qsl(next_url_parts.query, keep_blank_values=True))
         for key, value in request.params.items():
-            if key not in next_url_params and _is_sensitive_key(key, request._sensitive_params):
+            if key not in next_url_params and request._redaction.is_sensitive(key):
                 next_url_params[key] = value
         next_url_without_query = urlunsplit((next_url_parts.scheme, next_url_parts.netloc, next_url_parts.path, "", next_url_parts.fragment))
         return request.model_copy(update={"url": next_url_without_query, "params": next_url_params})
@@ -582,9 +629,9 @@ class HTTPModel(CallableModel):
     @Flow.call
     def __call__(self, context: HTTPRequestContext) -> HTTPResult:
         request = self._initial_paginated_request(self.build_request(context))
-        sensitive_params = request._sensitive_params
+        redaction = request._redaction
 
-        token = _REQUEST_SENSITIVE_PARAMS.set(sensitive_params)
+        token = _REQUEST_REDACTION.set(redaction)
         try:
             with httpx2.Client(**self._client_kwargs()) as client:
                 values = []
@@ -615,13 +662,13 @@ class HTTPModel(CallableModel):
                         break
                     request = next_request
         finally:
-            _REQUEST_SENSITIVE_PARAMS.reset(token)
+            _REQUEST_REDACTION.reset(token)
 
         return HTTPResult(
             value=None if accepted_error else (self._merge_page_values(values) if self.paginate else values[-1]),
             status_code=response.status_code,
             headers=dict(response.headers or {}),
-            url=redact_url(str(response.url), sensitive_params),
+            url=redaction.redact_url(str(response.url)),
             attempts=total_attempts,
             pages=pages,
             rate_limit=self._rate_limit_headers(dict(response.headers or {})),
