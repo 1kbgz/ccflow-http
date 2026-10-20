@@ -89,7 +89,13 @@ _QUERY_PAIR = re.compile(r"([?&])([^=&\s'\"]+)=([^&\s'\"]*)")
 
 def _is_sensitive_key(key: str, extra: Collection[str] = ()) -> bool:
     normalized_key = key.lower().replace("_", "").replace("-", "")
-    return key in extra or normalized_key in {"apikey", "authorization", "password"} or "token" in normalized_key or "secret" in normalized_key
+    return (
+        key in extra
+        or normalized_key in {"authorization", "password"}
+        or "apikey" in normalized_key
+        or "token" in normalized_key
+        or "secret" in normalized_key
+    )
 
 
 def redact_mapping(values: dict[str, Any], extra: Collection[str] = ()) -> dict[str, Any]:

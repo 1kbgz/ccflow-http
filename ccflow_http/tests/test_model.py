@@ -118,14 +118,14 @@ def test_safe_request_dump_redacts_secret_params_and_headers():
         method="GET",
         url="/v1/tickers/AAA",
         params={"date": "2024-01-03", "apiKey": "query-secret", "page_token": "cursor-secret"},
-        headers={"Authorization": "Bearer header-secret", "X-Request-ID": "abc"},
+        headers={"Authorization": "Bearer header-secret", "X-OPENFIGI-APIKEY": "vendor-secret", "X-Request-ID": "abc"},
     )
 
     assert safe_request_dump(request) == {
         "method": "GET",
         "url": "/v1/tickers/AAA",
         "params": {"date": "2024-01-03", "apiKey": "***", "page_token": "***"},
-        "headers": {"Authorization": "***", "X-Request-ID": "abc"},
+        "headers": {"Authorization": "***", "X-OPENFIGI-APIKEY": "***", "X-Request-ID": "abc"},
         "json_data": None,
         "content": None,
     }
