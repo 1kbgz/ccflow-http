@@ -18,6 +18,7 @@ from ccflow_http import (
     HTTPRequestContext,
     HTTPResponseResult,
     HTTPRetryPolicy,
+    RedactionPolicy,
     redact_url,
     safe_request_dump,
 )
@@ -797,3 +798,67 @@ def test_http_model_ignores_invalid_retry_after(monkeypatch):
     model(HTTPRequestContext())
 
     assert sleeps == [1.0]
+
+
+def test_redaction_policy_matches_normalized_names_substrings_and_patterns():
+    policy = RedactionPolicy(names={"X-Session"}, substrings={"Signature"}, patterns=[r"^sig\d+$"], mask="<redacted>")
+
+    assert policy.is_sensitive("x_session") and policy.is_sensitive("X-SESSION")
+    assert policy.is_sensitive("X-Amz-Signature")
+    assert policy.is_sensitive("sig2") and not policy.is_sensitive("signal")
+    assert not policy.is_sensitive("apiKey")
+    assert policy.with_names("apiKey").is_sensitive("API_KEY")
+    assert policy.redact_mapping({"X-Session": "s", "date": "d"}) == {"X-Session": "<redacted>", "date": "d"}
+    assert policy.redact_url("https://h/p?sig2=a&date=d") == "https://h/p?sig2=<redacted>&date=d"
+    assert policy.redact_text("failed for https://h/p?x-session=a&date=d") == "failed for https://h/p?x-session=<redacted>&date=d"
+
+
+def test_default_redaction_policy_covers_common_credential_names():
+    policy = RedactionPolicy()
+
+    for name in [
+        "Authorization",
+        "Proxy-Authorization",
+        "Cookie",
+        "Set-Cookie",
+        "password",
+        "apiKey",
+        "X-OPENFIGI-APIKEY",
+        "page_token",
+        "client_secret",
+    ]:
+        assert policy.is_sensitive(name), name
+    for name in ["date", "ticker", "X-Request-ID", "limit"]:
+        assert not policy.is_sensitive(name), name
+
+
+def test_http_model_applies_configured_and_auth_redaction_names_everywhere(caplog, monkeypatch):
+    monkeypatch.setattr("ccflow_http.base.sleep", lambda seconds: None)
+    seen = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen.append(request)
+        if len(seen) == 1:
+            raise httpx2.ConnectError(f"connection reset for {request.url}", request=request)
+        return httpx2.Response(200, json={"ok": True})
+
+    model = HTTPModel(
+        config=HTTPConfig(base_url="https://api.example.test", transport=httpx2.MockTransport(handler)),
+        path="/v1/items",
+        query={"sig": "query-secret", "date": "2025-01-02"},
+        headers={"X-Vendor-Session": "header-secret"},
+        auth=HTTPAuth(strategy="api_key_header", name="X-Partner", value="auth-secret"),
+        redaction=RedactionPolicy(names={"X-Vendor-Session"}, patterns=[r"^sig$"]),
+        retry_policy=HTTPRetryPolicy(max_attempts=2, wait_initial=0.0, wait_max=0.0, wait_jitter=0.0),
+    )
+
+    with caplog.at_level("INFO", logger="httpx2"):
+        result = model(HTTPRequestContext())
+    dump = safe_request_dump(model.build_request(HTTPRequestContext()))
+
+    assert seen[-1].headers["X-Partner"] == "auth-secret" and seen[-1].headers["X-Vendor-Session"] == "header-secret"
+    assert dump["headers"]["X-Partner"] == "***" and dump["headers"]["X-Vendor-Session"] == "***"
+    assert dump["params"] == {"sig": "***", "date": "2025-01-02"}
+    assert result.url == "https://api.example.test/v1/items?sig=***&date=2025-01-02"
+    assert "query-secret" not in caplog.text
+    assert "query-secret" not in result.retry_events[0]["message"]

@@ -10,7 +10,7 @@ from ccflow import CallableModel, DateContext, Flow, ResultBase
 from ccflow_etl import ArtifactWriteFileContext, ArtifactWriteFileModel, ArtifactWriteFileResult
 from pydantic import Field
 
-from .base import _REQUEST_SENSITIVE_PARAMS, HTTPModel, HTTPRequest, HTTPRequestContext, redact_url
+from .base import _REQUEST_REDACTION, HTTPModel, HTTPRequest, HTTPRequestContext
 
 __all__ = (
     "HTTPArtifactCaptureModel",
@@ -69,13 +69,13 @@ class HTTPDownloadModel(HTTPModel):
     @Flow.call
     def __call__(self, context: HTTPDownloadContext) -> HTTPDownloadResult:
         request = self.build_request(context)
-        sensitive_params = request._sensitive_params
+        redaction = request._redaction
         path = context.output_path
         path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
         digest = sha256()
         size = 0
-        token = _REQUEST_SENSITIVE_PARAMS.set(sensitive_params)
+        token = _REQUEST_REDACTION.set(redaction)
         try:
             with httpx2.Client(**self._client_kwargs()) as client:
                 response, attempts, events, _ = self._request_once(client, request, None)
@@ -92,13 +92,13 @@ class HTTPDownloadModel(HTTPModel):
             temp_path.unlink(missing_ok=True)
             raise
         finally:
-            _REQUEST_SENSITIVE_PARAMS.reset(token)
+            _REQUEST_REDACTION.reset(token)
         return HTTPDownloadResult(
             path=str(path),
             size=size,
             sha256=digest.hexdigest(),
             status_code=response.status_code,
-            url=redact_url(str(response.url), sensitive_params),
+            url=redaction.redact_url(str(response.url)),
             etag=response.headers.get("etag"),
             last_modified=response.headers.get("last-modified"),
             content_type=response.headers.get("content-type"),
