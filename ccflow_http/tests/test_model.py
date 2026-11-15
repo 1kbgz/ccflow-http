@@ -862,3 +862,38 @@ def test_http_model_applies_configured_and_auth_redaction_names_everywhere(caplo
     assert result.url == "https://api.example.test/v1/items?sig=***&date=2025-01-02"
     assert "query-secret" not in caplog.text
     assert "query-secret" not in result.retry_events[0]["message"]
+
+
+def test_http_model_redacts_sensitive_response_headers():
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
+            200,
+            json={"ok": True},
+            headers={"Set-Cookie": "session=cookie-secret", "X-Auth-Token": "token-secret", "X-Request-ID": "req-1"},
+        )
+
+    model = HTTPModel(
+        config=HTTPConfig(base_url="https://api.example.test", transport=httpx2.MockTransport(handler)),
+        path="/v1/items",
+    )
+
+    result = model(HTTPRequestContext())
+
+    assert result.headers["set-cookie"] == "***"
+    assert result.headers["x-auth-token"] == "***"
+    assert result.headers["x-request-id"] == "req-1"
+    assert "secret" not in repr(result)
+
+
+def test_http_auth_repr_omits_secrets():
+    auths = [
+        HTTPAuth(strategy="bearer", token="bearer-secret"),
+        HTTPAuth(strategy="api_key_header", name="X-Api-Key", value="key-secret"),
+        HTTPAuth(strategy="basic", username="svc", password="basic-secret"),
+    ]
+
+    for auth in auths:
+        assert "secret" not in repr(auth)
+        assert "secret" not in str(auth)
+    assert "X-Api-Key" in repr(auths[1])
+    assert "svc" in repr(auths[2])
