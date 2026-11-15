@@ -52,11 +52,11 @@ class HTTPConfig(BaseModel):
 
 class HTTPAuth(BaseModel):
     strategy: HTTPAuthStrategy = "none"
-    token: str | None = None
+    token: str | None = Field(default=None, repr=False)
     name: str | None = None
-    value: str | None = None
+    value: str | None = Field(default=None, repr=False)
     username: str | None = None
-    password: str | None = None
+    password: str | None = Field(default=None, repr=False)
     scheme: str = "Bearer"
 
 
@@ -667,7 +667,7 @@ class HTTPModel(CallableModel):
         return HTTPResult(
             value=None if accepted_error else (self._merge_page_values(values) if self.paginate else values[-1]),
             status_code=response.status_code,
-            headers=dict(response.headers or {}),
+            headers=redaction.redact_mapping(dict(response.headers or {})),
             url=redaction.redact_url(str(response.url)),
             attempts=total_attempts,
             pages=pages,
